@@ -1,3 +1,4 @@
+import time
 import math
 import torch
 import torch.nn.functional as F
@@ -6,7 +7,8 @@ from torch import nn
 from transformers.activations import ACT2FN
 from typing import Optional, Tuple, List, Union
 
-from .minimind_config import MiniMindConfig
+from myminimind.model.minimind_config import MiniMindConfig
+from myminimind.utils.logger import logger
 
 from transformers import PreTrainedModel, GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast
@@ -320,9 +322,11 @@ class MoEGate(nn.Module):
                 p = scores.mean(dim=1)
                 
                 # (batch_size, seq_len, num_routed_experts)
-                f = torch.zeros((batch_size, seq_len, self.num_routed_experts))
-                f.scatter_add_(dim=2, index=topk_idx, src=torch.ones_like(topk_idx))
+                f = torch.zeros((batch_size, seq_len, self.num_routed_experts), device=hidden_states.device)
+                f.scatter_add_(dim=2, index=topk_idx, src=torch.ones_like(topk_idx, device=hidden_states.device, dtype=f.dtype))
                 f = self.num_routed_experts / (self.top_k * seq_len) * f
+                f = f.reshape(-1, self.num_routed_experts)
+                f = f.mean(dim=0)
 
                 # (batch_size, )
                 aux_loss = self.alpha * (f * p).sum(dim=1)
@@ -336,8 +340,8 @@ class MoEGate(nn.Module):
                 p = p.mean(dim=0)
 
                 # (batch_size, seq_len, num_routed_experts)
-                f = torch.zeros((batch_size, seq_len, self.num_routed_experts))
-                f.scatter_add_(dim=2, index=topk_idx, src=torch.ones_like(topk_idx))
+                f = torch.zeros((batch_size, seq_len, self.num_routed_experts), device=hidden_states.device)
+                f.scatter_add_(dim=2, index=topk_idx, src=torch.ones_like(topk_idx, device=hidden_states.device, dtype=f.dtype))
                 # (batch_size * seq_len, num_routed_experts)
                 f = f.reshape(-1, self.num_routed_experts)
                 # (num_routed_experts, )
@@ -378,6 +382,7 @@ class MoEFeedForward(nn.Module):
         expert_buffer_weight: List[List[float]] = [[] for _ in range(self.config.num_routed_experts)]
 
         # all-to-all dispatch simulation
+        loop_begin_time = time.time()
         for sample_index in range(batch_size):
             for token_index in range(seq_len):
                 for i in range(top_k):
@@ -388,6 +393,9 @@ class MoEFeedForward(nn.Module):
 
                         tmp_token_weight = topk_weight[sample_index, token_index, i].item()
                         expert_buffer_weight[expert_index].append(tmp_token_weight)
+
+        loop_end_time = time.time()
+        # logger.info(f"MoE dispatch simulation time: {loop_end_time - loop_begin_time} seconds")
 
         # (batch_size, seq_len, hidden_size)
         y = torch.zeros_like(x)
@@ -568,6 +576,7 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
         if labels is not None:
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[:, 1:].contiguous()
+            # label中句子完成之后的padding token的id被赋值成了-100，因此这些token不计入损失
             loss = F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1), ignore_index=-100)
 
         output = CausalLMOutputWithPast(loss=loss, logits=logits, past_key_values=presents_key_values, hidden_states=hidden_states)

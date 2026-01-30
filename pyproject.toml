@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "myminimind"
+version = "0.1.0"
+description = "MyMinimind: MiniMind 模型与训练"
+readme = "README.md"
+requires-python = ">=3.10"
+# 依赖统一用 requirements.txt 管理（便于 torch 等走指定源），此处不声明
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["myminimind*"]
