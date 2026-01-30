@@ -61,7 +61,7 @@ class TrainConfig(BaseSettings):
     dtype: Literal["bfloat16", "float16"] = Field("bfloat16", description="混合精度类型")
 
     # ----- 数据 -----
-    data_path: str = Field("./datasets/pretrain_hq.jsonl", description="预训练数据路径（jsonl）")
+    data_path: str = Field("./dataset/pretrain_hq.jsonl", description="预训练数据路径（jsonl）")
     num_workers: int = Field(8, ge=0, description="DataLoader 线程数")
     max_seq_len: int = Field(340, gt=0, description="训练时最大截断长度（token）")
 

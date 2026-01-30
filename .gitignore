@@ -35,3 +35,5 @@ checkpoints/
 .env.*
 datasets
 datasets/
+dataset
+dataset/
