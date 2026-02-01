@@ -17,7 +17,7 @@ from torch import optim
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
 
-from myminimind.config import PretrainConfig, get_pretrain_config
+from myminimind.config import SFTConfig, get_sft_config
 from myminimind.utils.logger import logger
 from myminimind.utils.train_utils import (
     init_distributed,
@@ -29,13 +29,13 @@ from myminimind.utils.train_utils import (
 )
 from myminimind.model.minimind_config import MiniMindConfig
 from myminimind.model.minimind_model import MiniMindForCausalLM, CausalLMOutputWithPast
-from myminimind.data.lm_dataset import PretrainDataset
+from myminimind.data.lm_dataset import SFTDataset
 
 from typing import Optional, Union
 
 
 def train_epoch(
-    cfg: PretrainConfig,
+    cfg: SFTConfig,
     epoch: int,
     loader: DataLoader,
     model: MiniMindForCausalLM,
@@ -56,7 +56,7 @@ def train_epoch(
     epoch_avg_loss = 0.0
     epoch_avg_aux_loss = 0.0
     cur_step = 0
-    for step, (input_ids, labels) in enumerate(pbar, start=last_end_step):
+    for step, (input_ids, labels) in enumerate(pbar, start=last_end_step + 1):
         input_ids: torch.Tensor
         labels: torch.Tensor
         input_ids = input_ids.to(cfg.device)
@@ -134,7 +134,7 @@ def train_epoch(
 
 
 def train(
-    cfg: PretrainConfig,
+    cfg: SFTConfig,
     model: MiniMindForCausalLM,
     optimizer: optim.AdamW,
     lr_scheduler: optim.lr_scheduler.CosineAnnealingLR,
@@ -142,7 +142,7 @@ def train(
     autocast_ctx,
     lm_config: MiniMindConfig,
     train_sampler: Optional[DistributedSampler],
-    train_dataset: PretrainDataset,
+    train_dataset: SFTDataset,
     last_end_epoch: int,
     last_end_step: int,
     swanlab_=None,
@@ -166,12 +166,11 @@ def train(
             logger.info(f"Epoch[{epoch + 1}/{cfg.epochs}] 跳过前 {last_end_step} step，从 {last_end_step + 1} 开始")
             train_epoch(cfg, epoch, loader, model, optimizer, lr_scheduler, scaler, autocast_ctx, lm_config, last_end_step, swanlab_)
         else:
-            logger.info(f"Epoch[{epoch + 1}/{cfg.epochs}] 从头开始训练")
             train_epoch(cfg, epoch, loader, model, optimizer, lr_scheduler, scaler, autocast_ctx, lm_config, 0, swanlab_)
 
 
 def main():
-    cfg = get_pretrain_config()
+    cfg = get_sft_config()
 
     # ========== 1. 初始化环境和随机种子 ==========
     local_rank = init_distributed()
@@ -195,7 +194,7 @@ def main():
         swanlab_id = ckp_data.get("swanlab_id", None) if ckp_data else None
         resume = "must" if swanlab_id else None
         model_name = f"MiniMind{lm_config.hidden_size}{'_moe' if lm_config.use_moe else ''}"
-        name = f"{model_name}-Pretrain-E{cfg.epochs}-B{cfg.batch_size}-LR{cfg.learning_rate}"
+        name = f"{model_name}-SFT-E{cfg.epochs}-B{cfg.batch_size}-LR{cfg.learning_rate}"
         swanlab.init(project=cfg.swanlab_project, name=name, id=swanlab_id, resume=resume)
         swanlab_ = swanlab
 
@@ -211,7 +210,7 @@ def main():
         model = torch.compile(model)
         logger.info("torch.compile enabled")
 
-    train_dataset = PretrainDataset(cfg.data_path, tokenizer, max_length=cfg.max_seq_len)
+    train_dataset = SFTDataset(cfg.data_path, tokenizer, max_length=cfg.max_seq_len)
     train_sampler = DistributedSampler(train_dataset) if dist.is_initialized() else None
     scaler = torch.amp.GradScaler(enabled=(cfg.dtype == "float16"))
     optimizer = optim.AdamW(model.parameters(), lr=cfg.learning_rate)

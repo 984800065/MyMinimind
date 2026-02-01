@@ -23,7 +23,7 @@ def _default_device() -> str:
     return "cuda:0" if torch.cuda.is_available() else "cpu"
 
 
-class TrainConfig(BaseSettings):
+class PretrainConfig(BaseSettings):
     """
     预训练配置：可从 .env、环境变量（TRAIN_*）、配置文件、命令行加载，后者覆盖前者。
 
@@ -142,4 +142,68 @@ class InferConfig(BaseSettings):
             "num_hidden_layers": self.num_hidden_layers,
             "use_moe": self.use_moe,
             "inference_rope_scaling": self.inference_rope_scaling,
+        }
+
+
+class SFTConfig(BaseSettings):
+    """
+    Full SFT 配置：可从 .env、环境变量（SFT_*）、配置文件、命令行加载，后者覆盖前者。
+
+    使用方式：用 get_sft_config() 得到实例，例如：
+      cfg = get_sft_config()
+      lm_config = MiniMindConfig(**cfg.to_lm_config_kwargs())
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="SFT_",
+        env_nested_delimiter="__",
+        extra="ignore",
+        str_strip_whitespace=True,
+    )
+
+    # ----- 保存与输出 -----
+    save_dir: str = Field("../out", description="模型/checkpoint 保存目录")
+    save_weight: str = Field("full_sft", description="保存权重文件名前缀")
+    save_interval: int = Field(1000, gt=0, description="每 N step 保存一次")
+    log_interval: int = Field(100, gt=0, description="每 N step 打一次日志")
+
+    # ----- 训练超参 -----
+    epochs: int = Field(2, ge=1, description="训练轮数")
+    batch_size: int = Field(16, gt=0, description="batch size")
+    learning_rate: float = Field(1e-6, gt=0.0, description="初始学习率")
+    accumulation_steps: int = Field(1, ge=1, description="梯度累积步数")
+    grad_clip: float = Field(1.0, ge=0.0, description="梯度裁剪阈值")
+
+    # ----- 设备与精度 -----
+    device: str = Field(default_factory=_default_device, description="训练设备，如 cuda:0 / cpu")
+    dtype: Literal["bfloat16", "float16"] = Field("bfloat16", description="混合精度类型")
+
+    # ----- 数据 -----
+    data_path: str = Field("../dataset/sft_mini_512.jsonl", description="SFT 训练数据路径（jsonl）")
+    num_workers: int = Field(8, ge=0, description="DataLoader 线程数")
+    max_seq_len: int = Field(340, gt=0, description="训练时最大截断长度（token）")
+
+    # ----- 分词器 -----
+    tokenizer_path: str = Field("./myminimind/config/tokenizer", description="分词器路径")
+
+    # ----- 模型结构（与 MiniMindConfig 对齐） -----
+    hidden_size: int = Field(512, gt=0, description="隐藏层维度")
+    num_hidden_layers: int = Field(8, gt=0, description="隐藏层数量")
+    use_moe: bool = Field(False, description="是否使用 MoE 架构")
+
+    # ----- 恢复与续训 -----
+    from_weight: str = Field("pretrain", description="从哪个权重继续训，none 表示从头")
+    from_resume: bool = Field(False, description="是否自动检测 checkpoint 并续训")
+
+    # ----- 实验与工具 -----
+    use_swanlab: bool = Field(False, description="是否使用 swanlab 记录")
+    swanlab_project: str = Field("MiniMind-Full-SFT", description="swanlab 项目名")
+    use_compile: bool = Field(False, description="是否使用 torch.compile 加速")
+
+    def to_lm_config_kwargs(self) -> dict:
+        """抽出模型结构相关字段，传给 MiniMindConfig。"""
+        return {
+            "hidden_size": self.hidden_size,
+            "num_hidden_layers": self.num_hidden_layers,
+            "use_moe": self.use_moe,
         }

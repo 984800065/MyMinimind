@@ -21,10 +21,12 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def _rms(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.sqrt(x.pow(2).mean(-1, keepdim=True) + self.eps).type_as(x)
+        x_fp32 = x.float()
+        rms = torch.sqrt(x_fp32.pow(2).mean(-1, keepdim=True) + self.eps).type_as(x_fp32)
+        return rms.to(x.dtype)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x / self._rms(x) * self.weight
+        return x / self._rms(x) * self.weight.to(x.dtype)
 
 
 class YaRN:
@@ -233,7 +235,7 @@ class GroupQueryAttention(nn.Module):
                 # (batch_size, 1, 1, seq_len + past_seq_len)
                 extended_attention_mask = (1.0 - attention_mask[:, None, None, :]) * -1e9
                 # (batch_size, num_heads, seq_len, seq_len + past_seq_len)
-                attention_scores += extended_attention_mask
+                attention_scores = attention_scores + extended_attention_mask
 
             # (batch_size, num_heads, seq_len, seq_len + past_seq_len)
             attention_weights = F.softmax(attention_scores, dim=-1).type_as(q)
@@ -261,7 +263,7 @@ class GLU_FFN(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.dropout(self.down_proj(self.act_fn(self.gate_proj(x) * self.up_proj(x))))
+        return self.dropout(self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x)))
 
 
 class FeedForward(nn.Module):
@@ -300,19 +302,16 @@ class MoEGate(nn.Module):
         # hidden_states.shape == (batch_size, seq_len, hidden_size)
 
         # (batch_size, seq_len, num_routed_experts)
-        logits = F.linear(hidden_states, self.weight, None)
+        logits = F.linear(hidden_states, self.weight, None).float()
+        logits = logits - logits.max(dim=-1, keepdim=True).values
         if self.scoring_function == "softmax":
             # (batch_size, seq_len, num_routed_experts)
-            scores = logits.softmax(dim=-1)
+            scores = logits.softmax(dim=-1).to(hidden_states.dtype)
         else:
             raise NotImplementedError(f"unsupportable scoring function for MoE gating: {self.scoring_function}")
 
         # (batch_size, seq_len, top_k), (batch_size, seq_len, top_k)
         topk_weight, topk_idx = torch.topk(scores, k=self.top_k, dim=-1, sorted=False)
-
-        if self.top_k > 1 and self.norm_topk_prob:
-            denominator = topk_weight.sum(dim=-1, keepdim=True) + 1e-20
-            topk_weight = topk_weight / denominator
 
         if self.training and self.alpha > 0.0:
             if self.seq_aux:
@@ -322,10 +321,12 @@ class MoEGate(nn.Module):
                 
                 # (batch_size, seq_len, num_routed_experts)
                 f = torch.zeros((batch_size, seq_len, self.num_routed_experts), device=hidden_states.device)
-                f.scatter_add_(dim=2, index=topk_idx, src=torch.ones_like(topk_idx, device=hidden_states.device, dtype=f.dtype))
+                src = torch.ones(topk_idx.shape, device=hidden_states.device, dtype=f.dtype)
+                f.scatter_add_(dim=2, index=topk_idx, src=src)
+                # (batch_size, seq_len, num_routed_experts)
                 f = self.num_routed_experts / (self.top_k * seq_len) * f
-                f = f.reshape(-1, self.num_routed_experts)
-                f = f.mean(dim=0)
+                # (batch_size, num_routed_experts)
+                f = f.mean(dim=1)
 
                 # (batch_size, )
                 aux_loss = self.alpha * (f * p).sum(dim=1)
@@ -340,7 +341,8 @@ class MoEGate(nn.Module):
 
                 # (batch_size, seq_len, num_routed_experts)
                 f = torch.zeros((batch_size, seq_len, self.num_routed_experts), device=hidden_states.device)
-                f.scatter_add_(dim=2, index=topk_idx, src=torch.ones_like(topk_idx, device=hidden_states.device, dtype=f.dtype))
+                src = torch.ones(topk_idx.shape, device=hidden_states.device, dtype=f.dtype)
+                f.scatter_add_(dim=2, index=topk_idx, src=src)
                 # (batch_size * seq_len, num_routed_experts)
                 f = f.reshape(-1, self.num_routed_experts)
                 # (num_routed_experts, )
@@ -393,6 +395,7 @@ class MoEFeedForward(nn.Module):
         if self.config.norm_topk_prob:
             # (batch_size, seq_len, top_k)
             topk_weight = topk_weight / (topk_weight.sum(dim=-1, keepdim=True) + 1e-20)
+            topk_weight = topk_weight.to(flat_x.dtype)
         # (batch_size * seq_len * top_k, )
         flat_expert_weights = topk_weight.reshape(-1)
 
@@ -426,11 +429,14 @@ class MoEFeedForward(nn.Module):
                 tmp_flat_y = expert(flat_x[cur_selected_flat_token_indices])
                 # (cur_selected_token_num, )
                 tmp_flat_topk_weight = flat_expert_weights[cur_selected_flat_new_token_indices]
-                flat_y[cur_selected_flat_token_indices] += tmp_flat_y * tmp_flat_topk_weight[:, None]
+                # flat_y[cur_selected_flat_token_indices] += tmp_flat_y * tmp_flat_topk_weight[:, None]
+                flat_y.index_add_(dim=0, index=cur_selected_flat_token_indices, source=tmp_flat_y * tmp_flat_topk_weight[:, None])
 
         # shared expert parallel simulation
-        for shared_expert in self.shared_experts:
-            flat_y += shared_expert(flat_x)
+        if len(self.shared_experts) > 0:
+            scale = 1.0 / len(self.shared_experts)
+            for shared_expert in self.shared_experts:
+                flat_y += shared_expert(flat_x) * scale
 
         # (batch_size * seq_len, hidden_size)
         y = flat_y.reshape(batch_size, seq_len, hidden_size)
@@ -583,6 +589,8 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
             shift_labels = labels[:, 1:].contiguous()
             # label中句子完成之后的padding token的id被赋值成了-100，因此这些token不计入损失
             loss = F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1), ignore_index=-100)
+
+            assert not math.isnan(loss), f"loss is nan, shift_logits: {shift_logits}, shift_labels: {shift_labels}"
 
         output = CausalLMOutputWithPast(loss=loss, logits=logits, past_key_values=presents_key_values, hidden_states=hidden_states)
         output.aux_loss = aux_loss
