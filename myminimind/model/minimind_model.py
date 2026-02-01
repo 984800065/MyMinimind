@@ -200,9 +200,8 @@ class GroupQueryAttention(nn.Module):
         # (batch_size, seq_len, num_heads, head_dim), (batch_size, seq_len, num_key_value_heads, head_dim)
         q, k = position_embeddings(q, k, begin_pos, end_pos)
 
-        if use_kv_cache:
+        if past_key_values is not None:
             # Attention, this implementation of KV cache has wrong time complexity which is still O(n ^ 2)
-            assert past_key_values is not None, "past_key_values must be provided when use_kv_cache is True"
             # (batch_size, seq_len + past_seq_len, num_key_value_heads, head_dim)
             k = torch.cat([past_key_values[0], k], dim=1)
             # (batch_size, seq_len + past_seq_len, num_key_value_heads, head_dim)
@@ -227,12 +226,12 @@ class GroupQueryAttention(nn.Module):
             # (batch_size, num_heads, seq_len, seq_len + past_seq_len)
             attention_scores = torch.einsum("bhid,bhjd->bhij", q, k) / math.sqrt(head_dim)
             # (batch_size, num_heads, seq_len, seq_len + past_seq_len)
-            attention_scores[:, :, :, -seq_len:] = torch.triu(torch.full((seq_len, seq_len), float("-inf"), device=attention_scores.device), diagonal=1)
+            attention_scores[:, :, :, -seq_len:] += torch.triu(torch.full((seq_len, seq_len), float("-inf"), device=attention_scores.device), diagonal=1)
 
             # attention_mask.shape == (batch_size, seq_len + past_seq_len), full with 1 and 0. 1 means valid, 0 means masked.
             if attention_mask is not None:
                 # (batch_size, 1, 1, seq_len + past_seq_len)
-                extended_attention_mask = (1.0 - attention_mask[:, None, None, :]) * float("-inf")
+                extended_attention_mask = (1.0 - attention_mask[:, None, None, :]) * -1e9
                 # (batch_size, num_heads, seq_len, seq_len + past_seq_len)
                 attention_scores += extended_attention_mask
 
@@ -510,7 +509,6 @@ class MiniMindModel(nn.Module):
 
         if hasattr(past_key_values, "layers"):
             past_key_values = None
-
         past_key_values = past_key_values or [None] * self.num_hidden_layers
 
         # past_key_values[0][0].shape == (batch_size, past_seq_len, num_heads, head_dim)

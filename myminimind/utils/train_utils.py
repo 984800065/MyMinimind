@@ -50,7 +50,7 @@ def lm_checkpoint(
     epoch=0,
     step=0,
     swanlab_=None,
-    save_dir='../checkpoints',
+    save_dir='./checkpoints',
     **kwargs
 ) -> Optional[dict]:
     os.makedirs(save_dir, exist_ok=True)

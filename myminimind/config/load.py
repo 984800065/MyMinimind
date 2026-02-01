@@ -16,7 +16,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .schema import TrainConfig
+from .schema import InferConfig, TrainConfig
 
 
 def _load_json_or_yaml(path: Path) -> dict[str, Any]:
@@ -91,6 +91,38 @@ def _build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _build_infer_parser() -> argparse.ArgumentParser:
+    """构建推理/对话命令行解析器。所有参数 default=None，没传则不覆盖配置。"""
+    p = argparse.ArgumentParser(description="MiniMind模型推理与对话")
+    p.add_argument("--config", type=Path, default=None, help="配置文件路径 (json/yaml)")
+
+    # 模型加载
+    p.add_argument("--load-from", type=str, default=None, dest="load_from")
+    p.add_argument("--save-dir", type=str, default=None, dest="save_dir")
+    p.add_argument("--weight", type=str, default=None)
+    p.add_argument("--lora-weight", type=str, default=None, dest="lora_weight")
+
+    # 模型结构
+    p.add_argument("--hidden-size", type=int, default=None, dest="hidden_size")
+    p.add_argument("--num-hidden-layers", type=int, default=None, dest="num_hidden_layers")
+    p.add_argument("--use-moe", nargs="?", const="1", default=None, dest="use_moe", help="0/1 或省略即 1")
+
+    # 推理与生成
+    p.add_argument("--inference-rope-scaling", nargs="?", const="1", default=None, dest="inference_rope_scaling", help="启用RoPE外推")
+    p.add_argument("--max-new-tokens", type=int, default=None, dest="max_new_tokens")
+    p.add_argument("--temperature", type=float, default=None)
+    p.add_argument("--top-p", type=float, default=None, dest="top_p")
+
+    # 对话与展示
+    p.add_argument("--historys", type=int, default=None)
+    p.add_argument("--show-speed", type=int, default=None, dest="show_speed")
+
+    # 设备
+    p.add_argument("--device", type=str, default=None)
+
+    return p
+
+
 def get_config(args: list[str] | None = None) -> TrainConfig:
     """
     按「默认 → 配置文件 → 命令行」三层叠加，返回一个 TrainConfig 实例。
@@ -128,3 +160,32 @@ def get_config(args: list[str] | None = None) -> TrainConfig:
         config_dict[key] = val
 
     return TrainConfig(**config_dict)
+
+
+def get_infer_config(args: list[str] | None = None) -> InferConfig:
+    """
+    按「默认 → 配置文件 → 命令行」三层叠加，返回一个 InferConfig 实例。
+
+    用法：cfg = get_infer_config()，然后 cfg.load_from、cfg.max_new_tokens 等。
+    """
+    parser = _build_infer_parser()
+    parsed = parser.parse_args(args)
+
+    config_dict = InferConfig().model_dump()
+
+    if parsed.config is not None and parsed.config.exists():
+        file_dict = _load_json_or_yaml(parsed.config)
+        for k, v in file_dict.items():
+            if k in config_dict and v is not None:
+                config_dict[k] = v
+
+    infer_bool_keys = ("use_moe", "inference_rope_scaling")
+    for key in list(config_dict.keys()):
+        val = getattr(parsed, key, None)
+        if val is None:
+            continue
+        if key in infer_bool_keys:
+            val = _bool_opt(val)
+        config_dict[key] = val
+
+    return InferConfig(**config_dict)

@@ -94,3 +94,52 @@ class TrainConfig(BaseSettings):
             "num_hidden_layers": self.num_hidden_layers,
             "use_moe": self.use_moe,
         }
+
+
+class InferConfig(BaseSettings):
+    """
+    推理/对话配置：可从 .env、环境变量（INFER_*）、配置文件、命令行加载，后者覆盖前者。
+
+    对应推理脚本里的 argparse 参数，字段名和含义一一对应。
+    使用方式：用 get_infer_config() 得到实例。
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="INFER_",
+        env_nested_delimiter="__",
+        extra="ignore",
+        str_strip_whitespace=True,
+    )
+
+    # ----- 模型加载 -----
+    tokenizer_path: str = Field("./myminimind/config/tokenizer", description="分词器路径")
+    save_dir: str = Field("out", description="模型权重目录")
+    weight: str = Field("pretrain", description="权重名称前缀（pretrain, full_sft, rlhf, reason, ppo_actor, grpo, spo）")
+    lora_weight: str = Field("None", description="LoRA权重名称（None表示不使用，可选：lora_identity, lora_medical）")
+
+    # ----- 模型结构（与 MiniMindConfig 对齐） -----
+    hidden_size: int = Field(512, gt=0, description="隐藏层维度（512=Small-26M, 640=MoE-145M, 768=Base-104M）")
+    num_hidden_layers: int = Field(8, gt=0, description="隐藏层数量（Small/MoE=8, Base=16）")
+    use_moe: bool = Field(False, description="是否使用MoE架构")
+
+    # ----- 推理与生成 -----
+    inference_rope_scaling: bool = Field(False, description="启用RoPE位置编码外推（4倍，仅解决位置编码问题）")
+    max_new_tokens: int = Field(8192, gt=0, description="最大生成长度（注意：并非模型实际长文本能力）")
+    temperature: float = Field(0.85, ge=0.0, le=2.0, description="生成温度，控制随机性（0-1，越大越随机）")
+    top_p: float = Field(0.85, ge=0.0, le=1.0, description="nucleus采样阈值（0-1）")
+
+    # ----- 对话与展示 -----
+    historys: int = Field(0, ge=0, description="携带历史对话轮数（需为偶数，0表示不携带历史）")
+    show_speed: int = Field(1, ge=0, description="显示decode速度（tokens/s）")
+
+    # ----- 设备 -----
+    device: str = Field(default_factory=_default_device, description="运行设备")
+
+    def to_lm_config_kwargs(self) -> dict:
+        """抽出模型结构相关字段，传给 MiniMindConfig。"""
+        return {
+            "hidden_size": self.hidden_size,
+            "num_hidden_layers": self.num_hidden_layers,
+            "use_moe": self.use_moe,
+            "inference_rope_scaling": self.inference_rope_scaling,
+        }
