@@ -363,9 +363,9 @@ class MoEFeedForward(nn.Module):
         self.gate = MoEGate(config)
         self.shared_experts = nn.ModuleList([GLU_FFN(config) for _ in range(config.num_shared_experts)])
         self.capacity_factor = config.capacity_factor
-    
+
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        batch_size, seq_len, _ = x.shape
+        batch_size, seq_len, hidden_size = x.shape
         top_k = self.config.num_experts_per_token
 
         # topk_idx.shape == (batch_size, seq_len, top_k)
@@ -376,57 +376,64 @@ class MoEFeedForward(nn.Module):
         aux_loss: torch.Tensor
         topk_idx, topk_weight, aux_loss = self.gate(x)
 
+        # avoid bugs
+        topk_idx = topk_idx.contiguous()
+        topk_weight = topk_weight.contiguous()
+
         expert_capacity = math.ceil(batch_size * seq_len * top_k / self.config.num_routed_experts * self.capacity_factor)
-        expert_buffer_index: List[List[Tuple[int, int]]] = [[] for _ in range(self.config.num_routed_experts)]
-        expert_buffer_weight: List[List[float]] = [[] for _ in range(self.config.num_routed_experts)]
 
-        # all-to-all dispatch simulation
-        loop_begin_time = time.time()
-        for sample_index in range(batch_size):
-            for token_index in range(seq_len):
-                for i in range(top_k):
-                    expert_index = topk_idx[sample_index, token_index, i].item()
-                    if len(expert_buffer_index[expert_index]) < expert_capacity:
-                        tmp_token_index = (sample_index, token_index)
-                        expert_buffer_index[expert_index].append(tmp_token_index)
+        # (batch_size * seq_len, hidden_size)
+        flat_x = x.reshape(-1, hidden_size)
+        # (batch_size * seq_len, hidden_size)
+        flat_y = torch.zeros_like(flat_x)
 
-                        tmp_token_weight = topk_weight[sample_index, token_index, i].item()
-                        expert_buffer_weight[expert_index].append(tmp_token_weight)
+        # (batch_size * seq_len * top_k, )
+        flat_expert_indices = topk_idx.reshape(-1)
 
-        loop_end_time = time.time()
-        # logger.info(f"MoE dispatch simulation time: {loop_end_time - loop_begin_time} seconds")
+        if self.config.norm_topk_prob:
+            # (batch_size, seq_len, top_k)
+            topk_weight = topk_weight / (topk_weight.sum(dim=-1, keepdim=True) + 1e-20)
+        # (batch_size * seq_len * top_k, )
+        flat_expert_weights = topk_weight.reshape(-1)
 
-        # (batch_size, seq_len, hidden_size)
-        y = torch.zeros_like(x)
-        
+        # only difference between new_token and token is that new_token // top_k == token
+        # (batch_size * seq_len * top_k, )
+        new_token_indices_sorted_by_expert_id = torch.argsort(flat_expert_indices)
+        # (batch_size * seq_len * top_k, )
+        token_indices_sorted_by_expert_id = new_token_indices_sorted_by_expert_id // top_k
+
+        # (num_routed_experts, )
+        num_token_per_expert = flat_expert_indices.bincount(minlength=self.config.num_routed_experts).cumsum(dim=0)
+
+        start_index = 0
         # expert parallel simulation and all-to-all simulation
         for expert_index, expert in enumerate(self.experts):
-            buffer_size = len(expert_buffer_index[expert_index])
-            if buffer_size == 0:
-                continue
+            next_start_index = num_token_per_expert[expert_index].item()
+            cur_index_slice = slice(
+                start_index,
+                min(start_index + expert_capacity, next_start_index)
+            )
+            start_index = next_start_index
 
-            # (buffer_size, 2)
-            index_buffer = torch.tensor(expert_buffer_index[expert_index], dtype=torch.long, device=x.device)
-            # (buffer_size, )
-            weight_buffer = torch.tensor(expert_buffer_weight[expert_index], dtype=x.dtype, device=x.device)
+            cur_selected_flat_new_token_indices = new_token_indices_sorted_by_expert_id[cur_index_slice]
+            cur_selected_flat_token_indices = token_indices_sorted_by_expert_id[cur_index_slice]
 
-            # (buffer_size, hidden_size)
-            tmp_x = x[index_buffer[:, 0], index_buffer[:, 1]]
-            # (buffer_size, hidden_size)
-            tmp_y = expert(tmp_x)
-
-            y[index_buffer[:, 0], index_buffer[:, 1]] += weight_buffer[:, None] * tmp_y
+            if self.training and cur_index_slice.stop == cur_index_slice.start:
+                dummy = sum(p.sum() for p in expert.parameters()) * 0.0
+                flat_y = flat_y + dummy
+            else:
+                # (cur_selected_token_num, hidden_size)
+                tmp_flat_y = expert(flat_x[cur_selected_flat_token_indices])
+                # (cur_selected_token_num, )
+                tmp_flat_topk_weight = flat_expert_weights[cur_selected_flat_new_token_indices]
+                flat_y[cur_selected_flat_token_indices] += tmp_flat_y * tmp_flat_topk_weight[:, None]
 
         # shared expert parallel simulation
         for shared_expert in self.shared_experts:
-            y += shared_expert(x)
+            flat_y += shared_expert(flat_x)
 
-        # compatible with DDP in training
-        if self.training:
-            dummy = x.new_tensor(0.)
-            for expert_index, expert in enumerate(self.experts):
-                dummy += sum(p.sum() for p in expert.parameters()) * 0
-            y += dummy
+        # (batch_size * seq_len, hidden_size)
+        y = flat_y.reshape(batch_size, seq_len, hidden_size)
 
         return y, aux_loss
 
