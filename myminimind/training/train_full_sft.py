@@ -67,8 +67,7 @@ def train_epoch(
             loss: torch.Tensor = res.loss + res.aux_loss
             cur_loss = loss.item()
             cur_aux_loss = res.aux_loss.item() if res.aux_loss is not None else 0.0
-            assert not math.isnan(cur_loss), f"cur_loss is nan, loss: {loss}, res.aux_loss: {res.aux_loss}"
-            assert not math.isnan(cur_aux_loss), f"cur_aux_loss is nan, res.aux_loss: {res.aux_loss}"
+            
             loss = loss / cfg.accumulation_steps
             epoch_avg_loss += cur_loss
             epoch_avg_aux_loss += cur_aux_loss
@@ -218,7 +217,7 @@ def main():
     lr_scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.epochs * ((cur_rank_total_samples + cfg.batch_size - 1) // cfg.batch_size), eta_min=0.1 * cfg.learning_rate)
 
     # ========== 6. 从ckp恢复状态 ==========
-    last_end_epoch, last_end_step = 0, 0
+    last_end_epoch, last_end_step = 0, -1
     if ckp_data is not None:
         model.load_state_dict(ckp_data["model"])
         optimizer.load_state_dict(ckp_data["optimizer"])

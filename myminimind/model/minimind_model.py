@@ -54,7 +54,7 @@ class YaRN:
         high_index = min(self._beta_to_index(self.beta_slow), self.dim // 2 - 1)
         ramp = torch.clamp((torch.arange(self.dim // 2) - low_index) / max(high_index - low_index, 1e-3), 0, 1)
 
-        interpolated_freqs = freqs* (1 - ramp + ramp / self.factor)
+        interpolated_freqs = freqs * (1 - ramp + ramp / self.factor)
         return interpolated_freqs
 
     def __call__(self, freqs: torch.Tensor) -> torch.Tensor:
@@ -356,7 +356,7 @@ class MoEGate(nn.Module):
         
         return topk_idx, topk_weight, aux_loss
 
-    
+
 class MoEFeedForward(nn.Module):
     def __init__(self, config: MiniMindConfig):
         super().__init__()
@@ -365,10 +365,12 @@ class MoEFeedForward(nn.Module):
         self.gate = MoEGate(config)
         self.shared_experts = nn.ModuleList([GLU_FFN(config) for _ in range(config.num_shared_experts)])
         self.capacity_factor = config.capacity_factor
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         batch_size, seq_len, hidden_size = x.shape
         top_k = self.config.num_experts_per_token
+        x = self.norm(x)
 
         # topk_idx.shape == (batch_size, seq_len, top_k)
         # topk_weights.shape == (batch_size, seq_len, top_k)
@@ -441,7 +443,12 @@ class MoEFeedForward(nn.Module):
         # (batch_size * seq_len, hidden_size)
         y = flat_y.reshape(batch_size, seq_len, hidden_size)
 
-        return y, aux_loss
+        self.aux_loss = aux_loss
+        # original return function
+        # return y
+
+        # my return function
+        return y, self.aux_loss
 
 
 class MiniMindBlock(nn.Module):
@@ -551,7 +558,7 @@ class MiniMindModel(nn.Module):
 
         return hidden_states, presents_key_values, aux_loss
 
-    
+
 class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
     config_class = MiniMindConfig
 
