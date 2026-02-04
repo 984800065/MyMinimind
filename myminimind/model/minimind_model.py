@@ -73,10 +73,9 @@ class RoPEWithInterpolation(nn.Module):
         super().__init__()
         # (dim // 2, )
         freqs = 1.0 / (base ** (torch.arange(0, dim, 2) / dim))
-        attention_factor = params.get("attention_factor", 1.0)
 
         train_seq_len = params.get("train_seq_len", 2048)
-        if now_seq_len > train_seq_len or inference_rope_scaling:
+        if now_seq_len > train_seq_len and inference_rope_scaling:
             interpolation_type = params.get("interpolation_type", "yarn")
             
             if interpolation_type == "yarn":
@@ -95,6 +94,7 @@ class RoPEWithInterpolation(nn.Module):
         # (now_seq_len, dim // 2)
         phi = torch.outer(t, freqs)
 
+        attention_factor = params.get("attention_factor", 1.0)
         # (now_seq_len, dim)
         cos_phi = torch.cat([phi.cos(), phi.cos()], dim=-1) * attention_factor
         self.register_buffer("cos_phi", cos_phi)
