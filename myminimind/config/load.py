@@ -16,7 +16,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .schema import DPOConfig, InferConfig, PretrainConfig, SFTConfig
+from .schema import DPOConfig, DistillationConfig, InferConfig, PretrainConfig, SFTConfig
 
 
 def _load_json_or_yaml(path: Path) -> dict[str, Any]:
@@ -220,6 +220,53 @@ def _build_dpo_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _build_distillation_parser() -> argparse.ArgumentParser:
+    """构建 On-policy 蒸馏命令行解析器。所有参数 default=None，没传则不覆盖配置。"""
+    p = argparse.ArgumentParser(description="MiniMind On-policy Distillation (白盒蒸馏)")
+    p.add_argument("--config", type=Path, default=None, help="配置文件路径 (json/yaml)")
+
+    # 保存与输出
+    p.add_argument("--save-dir", type=str, default=None, dest="save_dir")
+    p.add_argument("--save-weight", type=str, default=None, dest="save_weight")
+    p.add_argument("--save-interval", type=int, default=None, dest="save_interval")
+    p.add_argument("--log-interval", type=int, default=None, dest="log_interval")
+
+    # 训练超参
+    p.add_argument("--epochs", type=int, default=None)
+    p.add_argument("--batch-size", type=int, default=None, dest="batch_size")
+    p.add_argument("--learning-rate", type=float, default=None, dest="learning_rate")
+    p.add_argument("--accumulation-steps", type=int, default=None, dest="accumulation_steps")
+    p.add_argument("--grad-clip", type=float, default=None, dest="grad_clip")
+
+    # 设备与精度
+    p.add_argument("--device", type=str, default=None)
+    p.add_argument("--dtype", type=str, default=None, choices=["bfloat16", "float16"])
+
+    # 数据
+    p.add_argument("--data-path", type=str, default=None, dest="data_path")
+    p.add_argument("--num-workers", type=int, default=None, dest="num_workers")
+    p.add_argument("--max-seq-len", type=int, default=None, dest="max_seq_len")
+
+    # 分词器
+    p.add_argument("--tokenizer-path", type=str, default=None, dest="tokenizer_path")
+
+    # 模型结构
+    p.add_argument("--hidden-size", type=int, default=None, dest="hidden_size")
+    p.add_argument("--num-hidden-layers", type=int, default=None, dest="num_hidden_layers")
+    p.add_argument("--use-moe", nargs="?", const="1", default=None, dest="use_moe", help="0/1 或省略即 1")
+
+    # 恢复与续训
+    p.add_argument("--from-weight", type=str, default=None, dest="from_weight")
+    p.add_argument("--from-resume", nargs="?", const="1", default=None, dest="from_resume", help="0/1 或省略即 1")
+
+    # 实验与工具
+    p.add_argument("--use-swanlab", nargs="?", const="1", default=None, dest="use_swanlab", help="启用 swanlab")
+    p.add_argument("--swanlab-project", type=str, default=None, dest="swanlab_project")
+    p.add_argument("--use-compile", nargs="?", const="1", default=None, dest="use_compile", help="0/1 或省略即 1")
+
+    return p
+
+
 def get_pretrain_config(args: list[str] | None = None) -> PretrainConfig:
     """
     按「默认 → 配置文件 → 命令行」三层叠加，返回一个 PretrainConfig 实例。
@@ -344,3 +391,32 @@ def get_dpo_config(args: list[str] | None = None) -> DPOConfig:
         config_dict[key] = val
 
     return DPOConfig(**config_dict)
+
+
+def get_distillation_config(args: list[str] | None = None) -> DistillationConfig:
+    """
+    按「默认 → 配置文件 → 命令行」三层叠加，返回一个 DistillationConfig 实例。
+
+    用法：cfg = get_distillation_config()，然后 cfg.batch_size、cfg.to_lm_config_kwargs() 等。
+    """
+    parser = _build_distillation_parser()
+    parsed = parser.parse_args(args)
+
+    config_dict = DistillationConfig().model_dump()
+
+    if parsed.config is not None and parsed.config.exists():
+        file_dict = _load_json_or_yaml(parsed.config)
+        for k, v in file_dict.items():
+            if k in config_dict and v is not None:
+                config_dict[k] = v
+
+    distill_bool_keys = ("use_moe", "from_resume", "use_swanlab", "use_compile")
+    for key in list(config_dict.keys()):
+        val = getattr(parsed, key, None)
+        if val is None:
+            continue
+        if key in distill_bool_keys:
+            val = _bool_opt(val)
+        config_dict[key] = val
+
+    return DistillationConfig(**config_dict)
