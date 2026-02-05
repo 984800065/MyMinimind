@@ -46,7 +46,6 @@ def lm_checkpoint(
     weight: str ='full_sft',
     model=None,
     optimizer=None,
-    scaler=None,
     epoch=0,
     step=0,
     swanlab_=None,
@@ -77,7 +76,6 @@ def lm_checkpoint(
         resume_data = {
             'model': state_dict,
             'optimizer': optimizer.state_dict(),
-            'scaler': scaler.state_dict(),
             'epoch': epoch,
             'step': step,
             'world_size': dist.get_world_size() if dist.is_initialized() else 1,
@@ -133,7 +131,17 @@ def init_model(lm_config: MiniMindConfig, from_weight: str, tokenizer_path: str,
     if from_weight != 'none':
         moe_suffix = '_moe' if lm_config.use_moe else ''
         weight_path = f'{save_dir}/{from_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
-        weights = torch.load(weight_path, map_location=device)
+        weights: dict = torch.load(weight_path, map_location=device)
+                
+        ignore_keys = {
+            "model.position_embeddings.cos_phi",
+            "model.position_embeddings.sin_phi",
+        }
+
+        for k in list(weights.keys()):
+            if k in ignore_keys:
+                weights.pop(k)
+        
         model.load_state_dict(weights, strict=False)
 
     get_model_params(model, lm_config)
