@@ -10,7 +10,7 @@ class MiniMindConfig(PretrainedConfig):
         bos_token_id: int = 1,
         eos_token_id: int = 2,
         hidden_act: str = "silu",
-        hidden_size: int = 512, 
+        hidden_size: int = 640, 
         intermediate_size: int = None,
         max_seq_len: int = 32768,
         num_attention_heads: int = 8,
@@ -23,7 +23,7 @@ class MiniMindConfig(PretrainedConfig):
         flash_attention: bool = False,
 
         # MoE configurations
-        use_moe: bool = False,
+        use_moe: bool = True,
         num_experts_per_token: int = 2,
         num_routed_experts: int = 4,
         num_shared_experts: int = 1,

@@ -69,9 +69,9 @@ class PretrainConfig(BaseSettings):
     tokenizer_path: str = Field("./myminimind/config/tokenizer", description="分词器路径")
 
     # ----- 模型结构（与 MiniMindConfig 对齐） -----
-    hidden_size: int = Field(512, gt=0, description="隐藏层维度")
+    hidden_size: int = Field(640, gt=0, description="隐藏层维度")
     num_hidden_layers: int = Field(8, gt=0, description="隐藏层数量")
-    use_moe: bool = Field(False, description="是否使用 MoE 架构")
+    use_moe: bool = Field(True, description="是否使用 MoE 架构")
 
     # ----- 恢复与续训 -----
     from_weight: str = Field("none", description="从哪个权重继续训，none 表示从头")
@@ -118,9 +118,9 @@ class InferConfig(BaseSettings):
     lora_weight: str = Field("None", description="LoRA权重名称（None表示不使用，可选：lora_identity, lora_medical）")
 
     # ----- 模型结构（与 MiniMindConfig 对齐） -----
-    hidden_size: int = Field(512, gt=0, description="隐藏层维度（512=Small-26M, 640=MoE-145M, 768=Base-104M）")
+    hidden_size: int = Field(640, gt=0, description="隐藏层维度（512=Small-26M, 640=MoE-145M, 768=Base-104M）")
     num_hidden_layers: int = Field(8, gt=0, description="隐藏层数量（Small/MoE=8, Base=16）")
-    use_moe: bool = Field(False, description="是否使用MoE架构")
+    use_moe: bool = Field(True, description="是否使用MoE架构")
 
     # ----- 推理与生成 -----
     inference_rope_scaling: bool = Field(False, description="启用RoPE位置编码外推（4倍，仅解决位置编码问题）")
@@ -187,16 +187,16 @@ class SFTConfig(BaseSettings):
     tokenizer_path: str = Field("./myminimind/config/tokenizer", description="分词器路径")
 
     # ----- 模型结构（与 MiniMindConfig 对齐） -----
-    hidden_size: int = Field(512, gt=0, description="隐藏层维度")
+    hidden_size: int = Field(640, gt=0, description="隐藏层维度")
     num_hidden_layers: int = Field(8, gt=0, description="隐藏层数量")
-    use_moe: bool = Field(False, description="是否使用 MoE 架构")
+    use_moe: bool = Field(True, description="是否使用 MoE 架构")
 
     # ----- 恢复与续训 -----
     from_weight: str = Field("pretrain", description="从哪个权重继续训，none 表示从头")
     from_resume: bool = Field(False, description="是否自动检测 checkpoint 并续训")
 
     # ----- 实验与工具 -----
-    use_swanlab: bool = Field(False, description="是否使用 swanlab 记录")
+    use_swanlab: bool = Field(True, description="是否使用 swanlab 记录")
     swanlab_project: str = Field("MiniMind-Full-SFT", description="swanlab 项目名")
     use_compile: bool = Field(False, description="是否使用 torch.compile 加速")
 
