@@ -4,43 +4,37 @@ MiniMind GRPO 训练入口：get_grpo_config() 加载参数，DDP + 混合精度
 
 import os
 import re
-import gc
-import time
+from contextlib import nullcontext
 
 import swanlab
 import torch
 import torch.distributed as dist
-
-from typing import List
-
-from tqdm.auto import tqdm
-
-from contextlib import nullcontext
 from torch import optim
 from torch.nn.parallel import DistributedDataParallel
-from torch.utils.data import DataLoader, DistributedSampler
 from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.utils.data import DataLoader, DistributedSampler
+from tqdm.auto import tqdm
 from transformers import AutoModel, AutoTokenizer
 
 from myminimind.config import GRPOConfig, get_grpo_config
-from myminimind.utils.logger import logger
-from myminimind.utils.train_utils import (
-    init_distributed,
-    setup_seed,
-    lm_checkpoint,
-    is_main_process,
-    init_model,
-    SkipBatchSampler,
-)
+from myminimind.data.lm_dataset import RLAIFDataset
 from myminimind.model.minimind_config import MiniMindConfig
 from myminimind.model.minimind_model import MiniMindForCausalLM
-from myminimind.data.lm_dataset import RLAIFDataset
+from myminimind.utils.logger import logger
+from myminimind.utils.train_utils import (
+    SkipBatchSampler,
+    init_distributed,
+    init_model,
+    is_main_process,
+    lm_checkpoint,
+    setup_seed,
+)
 
 
 def calculate_rewards(
     cfg: GRPOConfig,
-    prompts: List[str],
-    responses: List[str],
+    prompts: list[str],
+    responses: list[str],
     reward_model,
     reward_tokenizer,
 ) -> torch.Tensor:
@@ -60,7 +54,7 @@ def calculate_rewards(
             else:
                 format_rewards.append(0.0)
         rewards += torch.tensor(format_rewards, device=cfg.device)
-    
+
         def mark_num(text):
             reward = 0
             if text.count("<think>") == 1:
@@ -76,7 +70,7 @@ def calculate_rewards(
         mark_rewards = [mark_num(response) for response in responses]
         rewards += torch.tensor(mark_rewards, device=cfg.device)
         return rewards
-    
+
     # (batch_size * num_generations, )
     rewards = torch.zeros(len(responses), device=cfg.device)
     if cfg.reasoning == 1:
@@ -95,22 +89,22 @@ def calculate_rewards(
                 prompt = prompts[i]
 
                 pattern = r"<\|im_start\|>(system|user|assistant)\s+(.*?)<\|im_end\|>"
-                matches: List[dict] = re.findall(pattern, prompt, re.DOTALL)
+                matches: list[dict] = re.findall(pattern, prompt, re.DOTALL)
                 messages = [{"role": role, "content": content.strip()} for role, content in matches]
 
-                tmp_chat: List[dict] = messages + [{"role": "assistant", "content": response}]
+                tmp_chat: list[dict] = messages + [{"role": "assistant", "content": response}]
                 score = reward_model.get_score(reward_tokenizer, tmp_chat)
                 score = max(min(score, scale), -scale)
 
                 if cfg.reasoning == 1:
-                    answer_match = re.search(r'<answer>(.*?)</answer>', response, re.DOTALL)
+                    answer_match = re.search(r"<answer>(.*?)</answer>", response, re.DOTALL)
                     if answer_match:
                         answer_content = answer_match.group(1).strip()
                         tmp_chat = messages + [{"role": "assistant", "content": answer_content}]
                         answer_score = reward_model.get_score(reward_tokenizer, tmp_chat)
                         answer_score = max(min(answer_score, scale), -scale)
                         score = score * 0.4 + answer_score * 0.6
-                
+
                 reward_model_scores.append(score)
 
         # (batch_size * num_generations, )
@@ -143,35 +137,21 @@ def grpo_train_epoch(
 
     for step, batch in enumerate(pbar):
         # len(prompts) == batch_size
-        prompts: List[str] = batch["prompt"]
-        prompt_inputs = tokenizer(
-            prompts,
-            return_tensors="pt",
-            padding=True,
-            return_token_type_ids = False,
-            padding_side="left",
-            add_special_tokens=False
-        ).to(cfg.device)
+        prompts: list[str] = batch["prompt"]
+        prompt_inputs = tokenizer(prompts, return_tensors="pt", padding=True, return_token_type_ids=False, padding_side="left", add_special_tokens=False).to(cfg.device)
 
         if cfg.max_seq_len:
             # (batch_size, max_seq_len)
-            prompt_inputs["input_ids"] = prompt_inputs["input_ids"][:, -cfg.max_seq_len:]
-            prompt_inputs["attention_mask"] = prompt_inputs["attention_mask"][:, -cfg.max_seq_len:]
+            prompt_inputs["input_ids"] = prompt_inputs["input_ids"][:, -cfg.max_seq_len :]
+            prompt_inputs["attention_mask"] = prompt_inputs["attention_mask"][:, -cfg.max_seq_len :]
 
         with torch.no_grad():
             model_for_gen = model.module if isinstance(model, DistributedDataParallel) else model
             # (batch_size * num_generations, prompt_len + response_len)
-            outputs = model_for_gen.generate(
-                **prompt_inputs,
-                max_new_tokens=cfg.max_gen_len,
-                do_sample=True,
-                temperature=0.8,
-                num_return_sequences=cfg.num_generations,
-                pad_token_id=tokenizer.pad_token_id
-            )
+            outputs = model_for_gen.generate(**prompt_inputs, max_new_tokens=cfg.max_gen_len, do_sample=True, temperature=0.8, num_return_sequences=cfg.num_generations, pad_token_id=tokenizer.pad_token_id)
 
         # (batch_size * num_generations, response_len)
-        completion_ids = outputs[:, prompt_inputs["input_ids"].size(1):]
+        completion_ids = outputs[:, prompt_inputs["input_ids"].size(1) :]
 
         def get_per_tokne_logps(
             model: MiniMindForCausalLM,
@@ -191,7 +171,7 @@ def grpo_train_epoch(
                 ids_row = ids_row.detach().clone() if ids_row.is_inference() else ids_row
                 # (n_keep, )
                 per_token_logps.append(torch.gather(logits_row.log_softmax(dim=-1), dim=-1, index=ids_row[:, None]).squeeze(1))
-            
+
             # (batch_size * num_generations, n_keep)
             return torch.stack(per_token_logps)
 
@@ -201,13 +181,13 @@ def grpo_train_epoch(
             per_token_logps = get_per_tokne_logps(model, outputs, completion_ids.size(1))
             res = model(outputs) if lm_config.use_moe else None
             aux_loss = res.aux_loss if res is not None else torch.tensor(0.0, device=cfg.device)
-        
+
         with torch.no_grad():
             # (batch_size * num_generations, response_len)
             ref_per_token_logps = get_per_tokne_logps(ref_model, outputs, completion_ids.size(1))
 
         # len(completions) == batch_size * num_generations
-        completions: List[str] = tokenizer.batch_decode(completion_ids, skip_special_tokens=True)
+        completions: list[str] = tokenizer.batch_decode(completion_ids, skip_special_tokens=True)
         # (batch_size * num_generations, )
         rewards: torch.Tensor = calculate_rewards(cfg, prompts, completions, reward_model, reward_tokenizer).to(cfg.device)
 
@@ -223,8 +203,8 @@ def grpo_train_epoch(
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
         # (batch_size * num_generations, response_len), dtype == torch.bool
-        is_eos: torch.Tensor = (completion_ids == tokenizer.eos_token_id)
-        eos_idx = torch.full((is_eos.size(0), ), is_eos.size(1), dtype=torch.long, device=cfg.device)
+        is_eos: torch.Tensor = completion_ids == tokenizer.eos_token_id
+        eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=cfg.device)
         # 找每条生成序列里第一个 EOS token 的位置
         eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
         # (batch_size * num_generations, response_len), dtype == torch.int
@@ -255,7 +235,7 @@ def grpo_train_epoch(
             current_aux_loss = aux_loss.item()
             avg_reward_val = rewards.mean().item()
             avg_len_val = completion_mask.sum(dim=1).float().mean().item()
-            current_lr = optimizer.param_groups[0]['lr']
+            current_lr = optimizer.param_groups[0]["lr"]
 
             # logger.info(
             #     f"Epoch:[{epoch + 1}/{cfg.epochs}]({step}/{iters}), "
@@ -271,21 +251,23 @@ def grpo_train_epoch(
             )
 
             if swanlab_ and is_main_process():
-                swanlab_.log({
-                    "policy_loss": policy_loss_val,
-                    "aux_loss": current_aux_loss,
-                    "reward": avg_reward_val,
-                    "avg_response_len": avg_len_val,
-                    "advantages_mean": advantages.mean().item(),
-                    "learning_rate": current_lr,
-                })
+                swanlab_.log(
+                    {
+                        "policy_loss": policy_loss_val,
+                        "aux_loss": current_aux_loss,
+                        "reward": avg_reward_val,
+                        "avg_response_len": avg_len_val,
+                        "advantages_mean": advantages.mean().item(),
+                        "learning_rate": current_lr,
+                    }
+                )
 
         if (step % cfg.save_interval == 0 or step == one_based_base_iters - 1) and is_main_process():
             model.eval()
-            moe_suffix = '_moe' if lm_config.use_moe else ''
-            ckp = f'{cfg.save_dir}/{cfg.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
+            moe_suffix = "_moe" if lm_config.use_moe else ""
+            ckp = f"{cfg.save_dir}/{cfg.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth"
             raw_model = model.module if isinstance(model, DistributedDataParallel) else model
-            raw_model = getattr(raw_model, '_orig_mod', raw_model)
+            raw_model = getattr(raw_model, "_orig_mod", raw_model)
             state_dict = raw_model.state_dict()
             torch.save({k: v.half().cpu() for k, v in state_dict.items()}, ckp)
             lm_checkpoint(
@@ -397,11 +379,14 @@ def main() -> None:
 
     # ========== 2. 配置目录、模型参数、检查ckp ==========
     os.makedirs(cfg.save_dir, exist_ok=True)
-    lm_config = MiniMindConfig(**GRPOConfig().to_lm_config_kwargs() | {
-        "hidden_size": cfg.hidden_size,
-        "num_hidden_layers": cfg.num_hidden_layers,
-        "use_moe": cfg.use_moe,
-    })
+    lm_config = MiniMindConfig(
+        **GRPOConfig().to_lm_config_kwargs()
+        | {
+            "hidden_size": cfg.hidden_size,
+            "num_hidden_layers": cfg.num_hidden_layers,
+            "use_moe": cfg.use_moe,
+        }
+    )
     ckp_data = lm_checkpoint(lm_config, weight=cfg.save_weight, save_dir=cfg.save_dir) if cfg.from_resume else None
 
     # ========== 3. 设置混合精度 ==========

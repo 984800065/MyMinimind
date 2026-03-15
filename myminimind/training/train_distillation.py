@@ -4,33 +4,29 @@ MiniMind On-policy 白盒蒸馏入口：get_distillation_config() 加载参数�
 
 import os
 import time
+from contextlib import nullcontext
 
 import swanlab
 import torch
 import torch.distributed as dist
-
-from tqdm.auto import tqdm
-
-from contextlib import nullcontext
 from torch import optim
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
+from tqdm.auto import tqdm
 
 from myminimind.config import DistillationConfig, get_distillation_config
+from myminimind.data.lm_dataset import SFTDataset
+from myminimind.model.minimind_config import MiniMindConfig
+from myminimind.model.minimind_model import CausalLMOutputWithPast, MiniMindForCausalLM
 from myminimind.utils.logger import logger
 from myminimind.utils.train_utils import (
-    init_distributed,
-    setup_seed,
-    lm_checkpoint,
-    is_main_process,
-    init_model,
     SkipBatchSampler,
+    init_distributed,
+    init_model,
+    is_main_process,
+    lm_checkpoint,
+    setup_seed,
 )
-from myminimind.model.minimind_config import MiniMindConfig
-from myminimind.model.minimind_model import MiniMindForCausalLM, CausalLMOutputWithPast
-from myminimind.data.lm_dataset import SFTDataset
-
-from typing import Optional, Union
 
 
 def train_epoch(
@@ -41,10 +37,10 @@ def train_epoch(
     optimizer: optim.AdamW,
     lr_scheduler: optim.lr_scheduler.CosineAnnealingLR,
     scaler: torch.amp.GradScaler,
-    autocast_ctx: Union[nullcontext, torch.amp.autocast],
+    autocast_ctx: nullcontext | torch.amp.autocast,
     lm_config: MiniMindConfig,
     last_end_step: int = 0,
-    swanlab_: Optional[swanlab.Run] = None,
+    swanlab_: swanlab.Run | None = None,
 ) -> None:
     model.train()
     start_time = time.time()
@@ -71,12 +67,7 @@ def train_epoch(
             epoch_avg_loss += cur_loss
             epoch_avg_aux_loss += cur_aux_loss
             cur_step += 1
-            pbar.set_postfix({
-                "batch_loss": cur_loss,
-                "epoch_avg_loss": epoch_avg_loss / cur_step,
-                "batch_aux_loss": cur_aux_loss,
-                "epoch_avg_aux_loss": epoch_avg_aux_loss / cur_step
-            })
+            pbar.set_postfix({"batch_loss": cur_loss, "epoch_avg_loss": epoch_avg_loss / cur_step, "batch_aux_loss": cur_aux_loss, "epoch_avg_aux_loss": epoch_avg_aux_loss / cur_step})
 
         # 累计梯度
         scaler.scale(loss).backward()
@@ -98,20 +89,14 @@ def train_epoch(
             current_lr = lr_scheduler.get_last_lr()[0]
             eta_min = spend_time / (step + 1) * total_iters // 60 - spend_time // 60
             if swanlab_:
-                swanlab_.log({
-                    "loss": cur_loss,
-                    "logits_loss": cur_logits_loss,
-                    "aux_loss": cur_aux_loss,
-                    "learning_rate": current_lr,
-                    "epoch_time": eta_min
-                })
+                swanlab_.log({"loss": cur_loss, "logits_loss": cur_logits_loss, "aux_loss": cur_aux_loss, "learning_rate": current_lr, "epoch_time": eta_min})
 
         if (step % cfg.save_interval == 0 or step == total_iters - 1) and is_main_process():
             model.eval()
-            moe_suffix = '_moe' if lm_config.use_moe else ''
-            ckp = f'{cfg.save_dir}/{cfg.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
+            moe_suffix = "_moe" if lm_config.use_moe else ""
+            ckp = f"{cfg.save_dir}/{cfg.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth"
             raw_model = model.module if isinstance(model, DistributedDataParallel) else model
-            raw_model = getattr(raw_model, '_orig_mod', raw_model)
+            raw_model = getattr(raw_model, "_orig_mod", raw_model)
             state_dict = raw_model.state_dict()
             torch.save({k: v.half().cpu() for k, v in state_dict.items()}, ckp)
             lm_checkpoint(
@@ -139,7 +124,7 @@ def train(
     scaler: torch.amp.GradScaler,
     autocast_ctx,
     lm_config: MiniMindConfig,
-    train_sampler: Optional[DistributedSampler],
+    train_sampler: DistributedSampler | None,
     train_dataset: SFTDataset,
     last_end_epoch: int,
     last_end_step: int,

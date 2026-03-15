@@ -17,7 +17,7 @@
   infer_cfg = get_infer_config()   # 推理
 """
 
-from .schema import DPOConfig, DistillationConfig, GRPOConfig, InferConfig, PretrainConfig, SFTConfig
-from .load import get_dpo_config, get_distillation_config, get_grpo_config, get_pretrain_config, get_infer_config, get_sft_config
+from .load import get_distillation_config, get_dpo_config, get_grpo_config, get_infer_config, get_pretrain_config, get_sft_config
+from .schema import DistillationConfig, DPOConfig, GRPOConfig, InferConfig, PretrainConfig, SFTConfig
 
 __all__ = ["DPOConfig", "DistillationConfig", "GRPOConfig", "InferConfig", "PretrainConfig", "SFTConfig", "get_dpo_config", "get_distillation_config", "get_grpo_config", "get_pretrain_config", "get_sft_config", "get_infer_config"]

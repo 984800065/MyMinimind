@@ -1,5 +1,6 @@
-import swanlab
 import random
+
+import swanlab
 
 # 初始化SwanLab
 run = swanlab.init(

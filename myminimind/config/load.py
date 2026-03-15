@@ -1,12 +1,12 @@
 """
-配置加载：按「默认 → 配置文件 → 命令行」三层覆盖，得到最终的 TrainConfig。
+配置加载：按「默认 → 配置文件 → 命令行」三层覆盖，得到最终的配置对象。
 
 为什么要分层：
   - 默认值：代码里写死一套合理默认。
   - 配置文件：不同实验用不同 json/yaml，不改代码。
   - 命令行：临时覆盖某几项（如 --batch-size 64），不用改文件。
 
-get_config() 是唯一入口，训练脚本里调用 cfg = get_config() 即可。
+按场景分别使用 get_pretrain_config() / get_infer_config() / get_sft_config() 等入口。
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .schema import DPOConfig, DistillationConfig, GRPOConfig, InferConfig, PretrainConfig, SFTConfig
+from .schema import DistillationConfig, DPOConfig, GRPOConfig, InferConfig, PretrainConfig, SFTConfig
 
 
 def _load_json_or_yaml(path: Path) -> dict[str, Any]:
@@ -28,6 +28,7 @@ def _load_json_or_yaml(path: Path) -> dict[str, Any]:
     if suffix in (".yaml", ".yml"):
         try:
             import yaml
+
             return yaml.safe_load(text) or {}
         except ImportError:
             raise ImportError("YAML 支持需要: pip install pyyaml") from None
@@ -46,7 +47,7 @@ def _bool_opt(s: str | None) -> bool | None:
 def _build_pretrain_parser() -> argparse.ArgumentParser:
     """
     构建命令行解析器。所有参数 default=None，表示「没传就不覆盖」：
-    这样在 get_config() 里只把「用户真正传了」的项覆盖到配置上，没传的用默认或配置文件里的值。
+    这样在 get_pretrain_config() 里只把「用户真正传了」的项覆盖到配置上，没传的用默认或配置文件里的值。
     """
     p = argparse.ArgumentParser(description="MiniMind 预训练")
     p.add_argument("--config", type=Path, default=None, help="配置文件路径 (json/yaml)")
@@ -73,6 +74,9 @@ def _build_pretrain_parser() -> argparse.ArgumentParser:
     p.add_argument("--num-workers", type=int, default=None, dest="num_workers")
     p.add_argument("--max-seq-len", type=int, default=None, dest="max_seq_len")
 
+    # 分词器
+    p.add_argument("--tokenizer-path", type=str, default=None, dest="tokenizer_path")
+
     # 模型结构
     p.add_argument("--hidden-size", type=int, default=None, dest="hidden_size")
     p.add_argument("--num-hidden-layers", type=int, default=None, dest="num_hidden_layers")
@@ -84,8 +88,8 @@ def _build_pretrain_parser() -> argparse.ArgumentParser:
     p.add_argument("--from-resume", nargs="?", const="1", default=None, dest="from_resume", help="0/1 或省略即 1")
 
     # 实验与工具
-    p.add_argument("--use-wandb", nargs="?", const="1", default=None, dest="use_wandb", help="启用 wandb")
-    p.add_argument("--wandb-project", type=str, default=None, dest="wandb_project")
+    p.add_argument("--use-swanlab", nargs="?", const="1", default=None, dest="use_swanlab", help="启用 swanlab")
+    p.add_argument("--swanlab-project", type=str, default=None, dest="swanlab_project")
     p.add_argument("--use-compile", nargs="?", const="1", default=None, dest="use_compile", help="0/1 或省略即 1")
 
     return p
@@ -97,7 +101,7 @@ def _build_infer_parser() -> argparse.ArgumentParser:
     p.add_argument("--config", type=Path, default=None, help="配置文件路径 (json/yaml)")
 
     # 模型加载
-    p.add_argument("--load-from", type=str, default=None, dest="load_from")
+    p.add_argument("--tokenizer-path", type=str, default=None, dest="tokenizer_path")
     p.add_argument("--save-dir", type=str, default=None, dest="save_dir")
     p.add_argument("--weight", type=str, default=None)
     p.add_argument("--lora-weight", type=str, default=None, dest="lora_weight")
@@ -354,7 +358,7 @@ def get_pretrain_config(args: list[str] | None = None) -> PretrainConfig:
         if val is None:
             continue
         # 命令行里布尔类参数可能是字符串 "0"/"1"，转成 bool
-        if key in ("use_moe", "from_resume", "use_wandb", "use_compile"):
+        if key in ("use_moe", "from_resume", "use_swanlab", "use_compile"):
             val = _bool_opt(val)
         config_dict[key] = val
 
@@ -365,7 +369,7 @@ def get_infer_config(args: list[str] | None = None) -> InferConfig:
     """
     按「默认 → 配置文件 → 命令行」三层叠加，返回一个 InferConfig 实例。
 
-    用法：cfg = get_infer_config()，然后 cfg.load_from、cfg.max_new_tokens 等。
+    用法：cfg = get_infer_config()，然后 cfg.tokenizer_path、cfg.weight、cfg.max_new_tokens 等。
     """
     parser = _build_infer_parser()
     parsed = parser.parse_args(args)

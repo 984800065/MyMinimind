@@ -1,8 +1,8 @@
 from transformers import PretrainedConfig
 
 
-class MiniMindConfig(PretrainedConfig):
-    model_type = "minimind"
+class MyMiniMindConfig(PretrainedConfig):
+    model_type = "myminimind"
 
     def __init__(
         self,
@@ -11,7 +11,7 @@ class MiniMindConfig(PretrainedConfig):
         eos_token_id: int = 2,
         hidden_act: str = "silu",
         hidden_size: int = 640,
-        intermediate_size: int = None,
+        intermediate_size: int | None = None,
         max_seq_len: int = 32768,
         num_attention_heads: int = 8,
         num_hidden_layers: int = 8,
@@ -64,7 +64,7 @@ class MiniMindConfig(PretrainedConfig):
         self.rope_base = rope_base
         self.inference_rope_scaling = inference_rope_scaling
         # factor == max_seq_len / train_seq_len == 16
-        self.rope_params = {"beta_fast": 32, "beta_slow": 1, "factor": 16, "train_seq_len": 2048, "attention_factor": 1.0, "interpolation_type": "yarn"}
+        self.rope_params = {"rope_theta": rope_base, "beta_fast": 32, "beta_slow": 1, "factor": 16, "train_seq_len": 2048, "attention_factor": 1.0, "interpolation_type": "yarn"}
 
         self.flash_attention = flash_attention
 

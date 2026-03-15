@@ -4,7 +4,7 @@
 作用：
   - 把所有训练相关参数写在一个类里，带类型和校验（如 batch_size > 0）。
   - 配合 pydantic-settings：无参构造时自动从 .env 和环境变量（TRAIN_*）读值。
-  - 和 load.get_config() 一起用：get_config 会按「默认 → 配置文件 → 命令行」逐层覆盖，最后得到这个类的实例。
+  - 和 load.get_*_config() 一起用：对应入口会按「默认 → 配置文件 → 命令行」逐层覆盖，最后得到这个类的实例。
 
 对应 train_pretrain 里原来的 argparse 参数，字段名和含义一一对应。
 """
@@ -27,18 +27,18 @@ class PretrainConfig(BaseSettings):
     """
     预训练配置：可从 .env、环境变量（TRAIN_*）、配置文件、命令行加载，后者覆盖前者。
 
-    使用方式：不要手写 TrainConfig(xxx)，而是用 get_config() 得到实例，例如：
-      cfg = get_config()
+    使用方式：不要手写 PretrainConfig(xxx)，而是用 get_pretrain_config() 得到实例，例如：
+      cfg = get_pretrain_config()
       cfg.batch_size
       lm_config = MiniMindConfig(**cfg.to_lm_config_kwargs())
     """
 
     # ----- 下面这一块是 pydantic-settings 的配置，控制「从环境变量怎么读」 -----
     model_config = SettingsConfigDict(
-        env_prefix="TRAIN_",           # 环境变量前缀：TRAIN_BATCH_SIZE、TRAIN_LEARNING_RATE 等会映射到对应字段
-        env_nested_delimiter="__",     # 嵌套字段用双下划线，如 TRAIN_OPTIM__LR（当前 schema 无嵌套，可忽略）
-        extra="ignore",                # 环境变量里多出来的 key 不报错，直接忽略
-        str_strip_whitespace=True,     # 字符串自动去首尾空格
+        env_prefix="TRAIN_",  # 环境变量前缀：TRAIN_BATCH_SIZE、TRAIN_LEARNING_RATE 等会映射到对应字段
+        env_nested_delimiter="__",  # 嵌套字段用双下划线，如 TRAIN_OPTIM__LR（当前 schema 无嵌套，可忽略）
+        extra="ignore",  # 环境变量里多出来的 key 不报错，直接忽略
+        str_strip_whitespace=True,  # 字符串自动去首尾空格
     )
 
     # ----- 保存与输出 -----
@@ -87,7 +87,7 @@ class PretrainConfig(BaseSettings):
         只抽出「模型结构」相关字段，方便直接传给 MiniMindConfig。
 
         用法：lm_config = MiniMindConfig(**cfg.to_lm_config_kwargs())
-        这样训练配置和模型配置解耦，TrainConfig 管训练，MiniMindConfig 管模型结构。
+        这样训练配置和模型配置解耦，PretrainConfig 管训练，MiniMindConfig 管模型结构。
         """
         return {
             "hidden_size": self.hidden_size,

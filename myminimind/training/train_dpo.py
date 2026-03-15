@@ -1,38 +1,33 @@
 """
-MiniMind 预训练入口：get_config() 加载参数，DDP + 混合精度 + swanlab。
+MiniMind DPO 入口：get_dpo_config() 加载参数，DDP + 混合精度 + swanlab。
 """
 
 import os
 import time
-import math
+from contextlib import nullcontext
 
 import swanlab
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-
-from tqdm.auto import tqdm
-
-from contextlib import nullcontext
 from torch import optim
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
+from tqdm.auto import tqdm
 
 from myminimind.config import DPOConfig, get_dpo_config
+from myminimind.data.lm_dataset import DPODataset
+from myminimind.model.minimind_config import MiniMindConfig
+from myminimind.model.minimind_model import CausalLMOutputWithPast, MiniMindForCausalLM
 from myminimind.utils.logger import logger
 from myminimind.utils.train_utils import (
-    init_distributed,
-    setup_seed,
-    lm_checkpoint,
-    is_main_process,
-    init_model,
     SkipBatchSampler,
+    init_distributed,
+    init_model,
+    is_main_process,
+    lm_checkpoint,
+    setup_seed,
 )
-from myminimind.model.minimind_config import MiniMindConfig
-from myminimind.model.minimind_model import MiniMindForCausalLM, CausalLMOutputWithPast
-from myminimind.data.lm_dataset import DPODataset
-
-from typing import Optional, Union
 
 
 def logits_to_log_probs(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
@@ -57,7 +52,7 @@ def get_dop_loss(ref_log_probs: torch.Tensor, policy_log_probs: torch.Tensor, ma
     # 防止零长度mask导致除零NaN
     # (batch_size, )
     seq_lengths = mask.sum(dim=-1).clamp_min(1e-8)
-    
+
     # (batch_size, )
     ref_log_probs = (ref_log_probs * mask).sum(dim=-1) / seq_lengths
     # (batch_size, )
@@ -65,10 +60,10 @@ def get_dop_loss(ref_log_probs: torch.Tensor, policy_log_probs: torch.Tensor, ma
 
     # 将 chosen 和 rejected 数据分开
     batch_size = ref_log_probs.shape[0]
-    chosen_log_probs = ref_log_probs[:batch_size // 2]
-    rejected_log_probs = ref_log_probs[batch_size // 2:]
-    chosen_policy_log_probs = policy_log_probs[:batch_size // 2]
-    rejected_policy_log_probs = policy_log_probs[batch_size // 2:]
+    chosen_log_probs = ref_log_probs[: batch_size // 2]
+    rejected_log_probs = ref_log_probs[batch_size // 2 :]
+    chosen_policy_log_probs = policy_log_probs[: batch_size // 2]
+    rejected_policy_log_probs = policy_log_probs[batch_size // 2 :]
 
     pi_logratios = chosen_policy_log_probs - rejected_policy_log_probs
     ref_logratios = chosen_log_probs - rejected_log_probs
@@ -86,10 +81,10 @@ def train_epoch(
     optimizer: optim.AdamW,
     lr_scheduler: optim.lr_scheduler.CosineAnnealingLR,
     scaler: torch.amp.GradScaler,
-    autocast_ctx: Union[nullcontext, torch.amp.autocast],
+    autocast_ctx: nullcontext | torch.amp.autocast,
     lm_config: MiniMindConfig,
     last_end_step: int = 0,
-    swanlab_: Optional[swanlab.Run] = None,
+    swanlab_: swanlab.Run | None = None,
     beta: float = 0.1,
 ) -> None:
     model.train()
@@ -97,7 +92,7 @@ def train_epoch(
 
     total_iters = len(loader) + last_end_step + 1
     pbar = tqdm(loader, total=total_iters, initial=last_end_step, desc=f"Epoch[{epoch + 1}/{cfg.epochs}]", leave=True)
-    
+
     epoch_avg_loss = 0.0
     epoch_avg_aux_loss = 0.0
     cur_step = 0
@@ -134,13 +129,8 @@ def train_epoch(
             epoch_avg_aux_loss += cur_aux_loss
             loss = loss / cfg.accumulation_steps
             cur_step += 1
-            pbar.set_postfix({
-                "batch_loss": cur_loss,
-                "epoch_avg_loss": epoch_avg_loss / cur_step,
-                "batch_aux_loss": cur_aux_loss,
-                "epoch_avg_aux_loss": epoch_avg_aux_loss / cur_step
-            })
-        
+            pbar.set_postfix({"batch_loss": cur_loss, "epoch_avg_loss": epoch_avg_loss / cur_step, "batch_aux_loss": cur_aux_loss, "epoch_avg_aux_loss": epoch_avg_aux_loss / cur_step})
+
         # 累计梯度
         scaler.scale(loss).backward()
 
@@ -151,7 +141,7 @@ def train_epoch(
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad()
-        
+
         # 每一步结束，更新学习率
         lr_scheduler.step()
 
@@ -161,23 +151,14 @@ def train_epoch(
             current_lr = lr_scheduler.get_last_lr()[0]
             eta_min = spend_time / (step + 1) * total_iters // 60 - spend_time // 60
             if swanlab_:
-                swanlab_.log(
-                    {
-                        "total_loss": cur_loss,
-                        "dpo_loss": cur_dpo_loss,
-                        "aux_loss": cur_aux_loss,
-                        "learning_rate": current_lr,
-                        "epoch_time": eta_min
-                    },
-                    step=step
-                )
-        
+                swanlab_.log({"total_loss": cur_loss, "dpo_loss": cur_dpo_loss, "aux_loss": cur_aux_loss, "learning_rate": current_lr, "epoch_time": eta_min}, step=step)
+
         if (step % cfg.save_interval == 0 or step == total_iters - 1) and is_main_process():
             model.eval()
-            moe_suffix = '_moe' if lm_config.use_moe else ''
-            ckp = f'{cfg.save_dir}/{cfg.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
+            moe_suffix = "_moe" if lm_config.use_moe else ""
+            ckp = f"{cfg.save_dir}/{cfg.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth"
             raw_model = model.module if isinstance(model, DistributedDataParallel) else model
-            raw_model = getattr(raw_model, '_orig_mod', raw_model)
+            raw_model = getattr(raw_model, "_orig_mod", raw_model)
             state_dict = raw_model.state_dict()
             torch.save({k: v.half().cpu() for k, v in state_dict.items()}, ckp)
             lm_checkpoint(
@@ -193,7 +174,7 @@ def train_epoch(
             )
             model.train()
             del state_dict
-        
+
         del x_chosen, y_chosen, mask_chosen, x_rejected, y_rejected, mask_rejected, x, y, mask
         del ref_outputs, ref_logits, ref_log_probs, outputs, logits, policy_log_probs, dpo_loss, loss
 
@@ -207,7 +188,7 @@ def train(
     scaler: torch.amp.GradScaler,
     autocast_ctx,
     lm_config: MiniMindConfig,
-    train_sampler: Optional[DistributedSampler],
+    train_sampler: DistributedSampler | None,
     train_dataset: DPODataset,
     last_end_epoch: int,
     last_end_step: int,

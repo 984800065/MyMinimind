@@ -1,12 +1,13 @@
-from tqdm.auto import tqdm
 import json
+
+from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 
 tokenizer = AutoTokenizer.from_pretrained("myminimind/config/tokenizer")
 
 total_tokens = 0
 
-with open("dataset/sft_512.jsonl", "r") as f:
+with open("dataset/sft_512.jsonl") as f:
     for line in tqdm(f):
         conversations = json.loads(line)["conversations"]
         prompt = tokenizer.apply_chat_template(conversations, tokenize=False, add_generation_prompt=False)

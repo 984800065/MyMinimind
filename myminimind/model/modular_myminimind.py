@@ -5,9 +5,31 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import GenerationMixin, PreTrainedModel
 from transformers.activations import ACT2FN
+from transformers.cache_utils import Cache, DynamicCache
+from transformers.masking_utils import create_causal_mask
 from transformers.modeling_outputs import CausalLMOutputWithPast
+from transformers.processing_utils import Unpack
+from transformers.utils.generic import TransformersKwargs
 
-from myminimind.model.minimind_config import MiniMindConfig
+from myminimind.model.configuration_myminimind import MyMiniMindConfig
+
+
+def apply_rotary_pos_emb_interleave(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, position_ids: int | None = None, unsqueeze_dim: int = 1) -> tuple[torch.Tensor, torch.Tensor]:
+    # cos.shape == (batch_size, 1, seq_len, head_dim)
+    cos = cos.unsqueeze(unsqueeze_dim)
+    # sin.shape == (batch_size, 1, seq_len, head_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+
+    # q.shape == (batch_size, num_query_heads, seq_len, head_dim)
+    # k.shape == (batch_size, num_key_value_heads, seq_len, head_dim)
+
+    def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+        # x.shape == (batch_size, num_heads, seq_len, head_dim)
+        return torch.cat([-x[..., x.shape[-1] // 2 :], x[..., : x.shape[-1] // 2]], dim=-1)
+
+    q_embed = q * cos + _rotate_half(q) * sin
+    k_embed = k * cos + _rotate_half(k) * sin
+    return q_embed, k_embed
 
 
 class RMSNorm(nn.Module):
@@ -25,110 +47,74 @@ class RMSNorm(nn.Module):
         return x / self._rms(x) * self.weight.to(x.dtype)
 
 
-class YaRN:
-    def __init__(
-        self,
-        dim: int,
-        beta_fast: int,
-        beta_slow: int,
-        factor: int,
-        train_seq_len: int,
-        base: float = 1e6,
-    ):
-        self.dim = dim
-        self.beta_fast = beta_fast
-        self.beta_slow = beta_slow
-        self.factor = factor
-        self.train_seq_len = train_seq_len
-        self.base = base
+class RotaryEmbedding(nn.Module):
+    inv_freq: torch.Tensor
 
-    def _beta_to_index(self, beta: int) -> int:
-        return (self.dim // 2) * (math.log(self.train_seq_len / (2 * math.pi * beta)) / math.log(self.base))
-
-    def interpolate_freqs(self, freqs: torch.Tensor) -> torch.Tensor:
-        low_index = max(self._beta_to_index(self.beta_fast), 0)
-        high_index = min(self._beta_to_index(self.beta_slow), self.dim // 2 - 1)
-        ramp = torch.clamp((torch.arange(self.dim // 2) - low_index) / max(high_index - low_index, 1e-3), 0, 1)
-
-        interpolated_freqs = freqs * (1 - ramp + ramp / self.factor)
-        return interpolated_freqs
-
-    def __call__(self, freqs: torch.Tensor) -> torch.Tensor:
-        return self.interpolate_freqs(freqs)
-
-
-class RoPEWithInterpolation(nn.Module):
-    def __init__(
-        self,
-        dim: int,
-        now_seq_len: int,
-        params: dict,
-        base: float = 1e6,
-        inference_rope_scaling: bool = False,
-    ):
+    def __init__(self, config: MyMiniMindConfig, device=None):
         super().__init__()
-        # (dim // 2, )
-        freqs = 1.0 / (base ** (torch.arange(0, dim, 2) / dim))
+        self.max_seq_len_cached = config.max_seq_len
+        self.original_max_seq_len = config.max_seq_len
 
-        train_seq_len = params.get("train_seq_len", 2048)
-        if now_seq_len > train_seq_len and inference_rope_scaling:
-            interpolation_type = params.get("interpolation_type", "yarn")
+        self.config = config
 
-            if interpolation_type == "yarn":
-                factor = params.get("factor", 16)
-                beta_fast = params.get("beta_fast", 32)
-                beta_slow = params.get("beta_slow", 1)
-                yarn = YaRN(dim, beta_fast, beta_slow, factor, train_seq_len, base)
-                # (dim // 2, )
-                freqs = yarn(freqs)
-            else:
-                raise ValueError(f"Invalid interpolation type: {interpolation_type}")
+        self.rope_type = self.config.rope_params["interpolation_type"]
+        rope_init_fn = self.comput_default_rope_parameters
 
-        # (now_seq_len, )
-        t = torch.arange(now_seq_len, device=freqs.device)
+        inv_freq, self.attention_scaling = rope_init_fn(self.config, device)
 
-        # (now_seq_len, dim // 2)
-        phi = torch.outer(t, freqs)
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.register_buffer("original_inv_freq", inv_freq.clone(), persistent=False)
 
-        attention_factor = params.get("attention_factor", 1.0)
-        # (now_seq_len, dim)
-        cos_phi = torch.cat([phi.cos(), phi.cos()], dim=-1) * attention_factor
-        self.register_buffer("cos_phi", cos_phi)
-        # (now_seq_len, dim)
-        sin_phi = torch.cat([phi.sin(), phi.sin()], dim=-1) * attention_factor
-        self.register_buffer("sin_phi", sin_phi)
+    @staticmethod
+    def comput_default_rope_parameters(
+        config: MyMiniMindConfig,
+        device: torch.device | None = None,
+        seq_len: int | None = None,
+    ) -> tuple[torch.Tensor, float]:
+        base = config.rope_params["rope_theta"]
+        dim = config.hidden_size
 
-    def _rotate_half(self, x: torch.Tensor) -> torch.Tensor:
-        # (batch_size, seq_len, num_heads, head_dim)
-        return torch.cat([-x[..., x.shape[-1] // 2 :], x[..., : x.shape[-1] // 2]], dim=-1)
+        attention_factor = 1.0
 
-    def apply_rope(self, q: torch.Tensor, k: torch.Tensor, begin_pos: int, end_pos: int) -> tuple[torch.Tensor, torch.Tensor]:
-        # end_pos - begin_pos == seq_len
-        # q.shape == (batch_size, seq_len, num_heads, head_dim)
-        # k.shape == (batch_size, seq_len, num_key_value_heads, head_dim)
-        # self.cos_phi.shape == self.sin_phi.shape == (now_seq_len, dim) == (seq_len, dim)
+        # inv_freq.shape == (dim // 2)
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.int64).to(device=device, dtype=torch.float) / dim))
+        return inv_freq, attention_factor
 
-        # self.cos_phi[None, :, None, :].shape == (1, seq_len, 1, dim)
-        # self.sin_phi[None, :, None, :].shape == (1, seq_len, 1, dim)
+    @torch.no_grad()
+    def forward(self, x: torch.Tensor, position_ids: torch.Tensor):
+        # inv_freq_expanded.shape == (batch_size, dim // 2, 1)
+        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
 
-        # (batch_size, seq_len, num_heads, head_dim)
-        q = q * self.cos_phi[None, begin_pos:end_pos, None, :] + self._rotate_half(q) * self.sin_phi[None, begin_pos:end_pos, None, :]
-        # (batch_size, seq_len, num_key_value_heads, head_dim)
-        k = k * self.cos_phi[None, begin_pos:end_pos, None, :] + self._rotate_half(k) * self.sin_phi[None, begin_pos:end_pos, None, :]
+        # position_ids.shape == (batch_size, seq_len)
+        # position_ids_expanded.shape ==(batch_size, 1, seq_len)
+        position_ids_expanded = position_ids[:, None, :].float()
 
-        return q, k
+        device_type = x.device.type
+        # Force float32
+        with torch.autocast(device_type=device_type, enabled=False):
+            # freqs.shape == (batch_size, dim // 2, seq_len)
+            freqs = torch.einsum("bdi,bis->bds", inv_freq_expanded, position_ids_expanded)
+            # freqs.shape == (batch_size, seq_len, dim // 2)
+            freqs = freqs.transpose(1, 2)
+            emb = torch.cat([freqs, freqs], dim=-1)
+            # cos.shape == (batch_size, seq_len, head_dim)
+            cos = emb.cos() * self.attention_scaling
+            # sin.shape == (batch_size, seq_len, head_dim)
+            sin = emb.sin() * self.attention_scaling
 
-    def __call__(self, q: torch.Tensor, k: torch.Tensor, begin_pos: int, end_pos: int) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.apply_rope(q, k, begin_pos, end_pos)
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
 class GroupQueryAttention(nn.Module):
     def __init__(
         self,
-        config: MiniMindConfig,
+        config: MyMiniMindConfig,
+        layer_idx: int,
     ):
         super().__init__()
         self.config = config
+        self.layer_idx = layer_idx
+
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
         assert self.hidden_size % self.num_heads == 0, "hidden_size must be divisible by num_heads"
@@ -153,67 +139,56 @@ class GroupQueryAttention(nn.Module):
     def _repeat_kv(self, x: torch.Tensor, repeat_times: int) -> torch.Tensor:
         # return torch.repeat_interleave(x, repeat_times, dim=2)
 
-        # x.shape == (batch_size, seq_len, num_key_value_heads, head_dim)
-        batch_size, seq_len, num_key_value_heads, head_dim = x.shape
+        # x.shape == (batch_size, num_key_value_heads, seq_len, head_dim)
+        batch_size, num_key_value_heads, seq_len, head_dim = x.shape
         if repeat_times == 1:
             return x
         else:
-            return x[:, :, :, None, :].expand(batch_size, seq_len, num_key_value_heads, repeat_times, head_dim).reshape(batch_size, seq_len, num_key_value_heads * repeat_times, head_dim)
+            return x[:, :, None, :, :].expand(batch_size, num_key_value_heads, repeat_times, seq_len, head_dim).reshape(batch_size, num_key_value_heads * repeat_times, seq_len, head_dim)
 
     def forward(
         self,
-        x: torch.Tensor,
-        position_embeddings: RoPEWithInterpolation,
-        begin_pos: int,
-        end_pos: int,
-        use_kv_cache: bool = False,
-        past_key_values: tuple[torch.Tensor, torch.Tensor] | None = None,
-        attention_mask: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
-        # x.shape == (batch_size, seq_len, hidden_size)
-        batch_size, seq_len, _ = x.shape
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: torch.Tensor | None,
+        past_key_values: Cache | None = None,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> torch.Tensor | None:
+        # hidden_states.shape == (batch_size, seq_len, hidden_size)
+        batch_size, seq_len, _ = hidden_states.shape
         num_heads = self.num_heads
         num_key_value_heads = self.num_key_value_heads
         head_dim = self.head_dim
 
-        x = self.norm(x)
-
         # (batch_size, seq_len, num_heads * head_dim)
-        q: torch.Tensor = self.q_proj(x)
-        # (batch_size, seq_len, num_heads, head_dim)
-        q = q.reshape(batch_size, seq_len, num_heads, head_dim)
+        q: torch.Tensor = self.q_proj(hidden_states)
+        # (batch_size, num_heads, seq_len, head_dim)
+        q = q.reshape(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)
 
         # (batch_size, seq_len, num_key_value_heads * head_dim)
-        k: torch.Tensor = self.k_proj(x)
-        # (batch_size, seq_len, num_key_value_heads, head_dim)
-        k = k.reshape(batch_size, seq_len, num_key_value_heads, head_dim)
+        k: torch.Tensor = self.k_proj(hidden_states)
+        # (batch_size, num_key_value_heads, seq_len, head_dim)
+        k = k.reshape(batch_size, seq_len, num_key_value_heads, head_dim).transpose(1, 2)
 
         # (batch_size, seq_len, num_key_value_heads * head_dim)
-        v: torch.Tensor = self.v_proj(x)
-        # (batch_size, seq_len, num_key_value_heads, head_dim)
-        v = v.reshape(batch_size, seq_len, num_key_value_heads, head_dim)
+        v: torch.Tensor = self.v_proj(hidden_states)
+        # (batch_size, num_key_value_heads, seq_len, head_dim)
+        v = v.reshape(batch_size, seq_len, num_key_value_heads, head_dim).transpose(1, 2)
 
-        # (batch_size, seq_len, num_heads, head_dim), (batch_size, seq_len, num_key_value_heads, head_dim)
-        q, k = position_embeddings(q, k, begin_pos, end_pos)
+        cos, sin = position_embeddings
+        # q.shape == (batch_size, num_heads, seq_len, head_dim)
+        # k.shape == (batch_size, num_key_value_heads, seq_len, head_dim)
+        q, k = apply_rotary_pos_emb_interleave(q, k, cos=cos, sin=sin, position_ids=None, unsqueeze_dim=2)
 
         if past_key_values is not None:
-            # Attention, this implementation of KV cache has wrong time complexity which is still O(n ^ 2)
-            # (batch_size, seq_len + past_seq_len, num_key_value_heads, head_dim)
-            k = torch.cat([past_key_values[0], k], dim=1)
-            # (batch_size, seq_len + past_seq_len, num_key_value_heads, head_dim)
-            v = torch.cat([past_key_values[1], v], dim=1)
-
-        past_kv = (k, v) if use_kv_cache else None
-
-        # (batch_size, num_heads, seq_len, head_dim)
-        q = q.permute(0, 2, 1, 3)
+            k, v = past_key_values.update(k, v, self.layer_idx)
 
         assert num_heads % num_key_value_heads == 0, "num_heads must be divisible by num_key_value_heads"
         repeat_times = num_heads // num_key_value_heads
         # (batch_size, num_heads, seq_len + past_seq_len, head_dim)
-        k = self._repeat_kv(k, repeat_times).permute(0, 2, 1, 3)
+        k = self._repeat_kv(k, repeat_times)
         # (batch_size, num_heads, seq_len + past_seq_len, head_dim)
-        v = self._repeat_kv(v, repeat_times).permute(0, 2, 1, 3)
+        v = self._repeat_kv(v, repeat_times)
 
         if self.is_flash_attention and seq_len > 1 and past_key_values is None and (attention_mask is None or torch.all(attention_mask == 1)):
             # (batch_size, num_heads, seq_len, head_dim)
@@ -243,11 +218,11 @@ class GroupQueryAttention(nn.Module):
         output = output.reshape(batch_size, seq_len, -1)
         # (batch_size, seq_len, hidden_size)
         output = self.residual_dropout(self.out_proj(output))
-        return output, past_kv
+        return output
 
 
 class GLU_FFN(nn.Module):
-    def __init__(self, config: MiniMindConfig):
+    def __init__(self, config: MyMiniMindConfig):
         super().__init__()
         self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
         self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
@@ -261,7 +236,7 @@ class GLU_FFN(nn.Module):
 
 
 class FeedForward(nn.Module):
-    def __init__(self, config: MiniMindConfig):
+    def __init__(self, config: MyMiniMindConfig):
         super().__init__()
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.glu_ffn = GLU_FFN(config)
@@ -272,7 +247,7 @@ class FeedForward(nn.Module):
 
 
 class MoEGate(nn.Module):
-    def __init__(self, config: MiniMindConfig):
+    def __init__(self, config: MyMiniMindConfig):
         super().__init__()
         self.config = config
         self.top_k = config.num_experts_per_token
@@ -352,7 +327,7 @@ class MoEGate(nn.Module):
 
 
 class MoEFeedForward(nn.Module):
-    def __init__(self, config: MiniMindConfig):
+    def __init__(self, config: MyMiniMindConfig):
         super().__init__()
         self.config = config
         self.experts = nn.ModuleList([GLU_FFN(config) for _ in range(config.num_routed_experts)])
@@ -442,36 +417,49 @@ class MoEFeedForward(nn.Module):
         return y, self.aux_loss
 
 
-class MiniMindBlock(nn.Module):
-    def __init__(self, layer_id: int, config: MiniMindConfig):
+class MyMiniMindDecoderLayer(nn.Module):
+    def __init__(
+        self,
+        config: MyMiniMindConfig,
+        layer_idx: int,
+    ):
         super().__init__()
         self.config = config
         self.num_attention_heads = config.num_attention_heads
         self.hidden_size = config.hidden_size
         self.head_dim = self.hidden_size // self.num_attention_heads
-        self.self_attention = GroupQueryAttention(config)
+        self.self_attention = GroupQueryAttention(config, layer_idx)
 
-        self.layer_id = layer_id
+        self.layer_idx = layer_idx
         self.mlp = FeedForward(config) if not config.use_moe else MoEFeedForward(config)
 
+        self.input_layernorm = RMSNorm(config.hidden_size)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size)
+
     def forward(
-        self, hidden_states: torch.Tensor, position_embeddings: RoPEWithInterpolation, begin_pos: int, end_pos: int, use_kv_cache: bool = False, past_key_values: tuple[torch.Tensor, torch.Tensor] | None = None, attention_mask: torch.Tensor | None = None
-    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None, torch.Tensor]:
+        self, hidden_states: torch.Tensor, attention_mask: torch.Tensor | None = None, position_ids: torch.LongTensor | None = None, past_key_values: Cache | None = None, use_cache: bool | None = False, position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None, **kwargs: Unpack[TransformersKwargs]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
 
-        hidden_states, present_key_values = self.self_attention(hidden_states, position_embeddings, begin_pos, end_pos, use_kv_cache, past_key_values, attention_mask)
+        hidden_states = self.self_attention(hidden_states=hidden_states, attention_mask=attention_mask, position_ids=position_ids, past_key_values=past_key_values, use_cache=use_cache, position_embeddings=position_embeddings, **kwargs)
 
-        hidden_states += residual
+        hidden_states = residual + hidden_states
 
         residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states, aux_loss = self.mlp(hidden_states)
-        hidden_states += residual
+        hidden_states = residual + hidden_states
 
-        return hidden_states, present_key_values, aux_loss
+        return hidden_states, aux_loss
 
 
-class MiniMindModel(nn.Module):
-    def __init__(self, config: MiniMindConfig):
+class MyMinimindPreTrainedModel(PreTrainedModel):
+    config: MyMiniMindConfig
+
+
+class MyMiniMindModel(nn.Module):
+    def __init__(self, config: MyMiniMindConfig):
         super().__init__()
         self.config = config
         self.vocab_size = config.vocab_size
@@ -479,66 +467,91 @@ class MiniMindModel(nn.Module):
         self.embed_tokens = nn.Embedding(self.vocab_size, config.hidden_size)
         self.dropout = nn.Dropout(config.dropout)
 
-        self.layers = nn.ModuleList([MiniMindBlock(layer_id, config) for layer_id in range(self.num_hidden_layers)])
+        self.layers = nn.ModuleList([MyMiniMindDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)])
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.rotary_emb = RotaryEmbedding(config=config)
 
         assert config.hidden_size % config.num_attention_heads == 0, "hidden_size must be divisible by num_attention_heads"
-        head_dim = config.hidden_size // config.num_attention_heads
-        self.position_embeddings = RoPEWithInterpolation(
-            dim=head_dim,
-            now_seq_len=config.max_seq_len,
-            params=config.rope_params,
-            base=config.rope_base,
-            inference_rope_scaling=config.inference_rope_scaling,
+
+    def forward(
+        self, input_ids: torch.Tensor | None = None, attention_mask: torch.Tensor | None = None, position_ids: torch.Tensor | None = None, past_key_values: Cache | None = None, input_embeds: torch.FloatTensor | None = None, cache_position: torch.Tensor | None = None, use_cache: bool = False, **kwargs
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # input_ids.shape == (batch_size, seq_len)
+        if (input_ids is None) ^ (input_embeds is not None):
+            raise ValueError("You must specify exactly one of input_ids or input_embeds")
+
+        if input_embeds is None:
+            # input_embeds.shape == (batch_size, seq_len, hidden_dim)
+            input_embeds = self.embed_tokens(input_ids)
+            assert input_embeds is not None
+
+        batch_size, seq_len = input_embeds.shape[:2]
+
+        if use_cache and past_key_values is None:
+            past_key_values = DynamicCache(config=self.config)
+
+        if cache_position is None:
+            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+            # cache_position.shape == (seq_len, )
+            cache_position = torch.arange(
+                past_seen_tokens,
+                past_seen_tokens + seq_len,
+                device=input_embeds.device,
+                dtype=torch.long,
+            )
+
+        if position_ids is None:
+            # position_ids.shape == (1, seq_len)
+            position_ids = cache_position.unsqueeze(0)
+            # 如果你后面的 rotary 实现明确要求 batch 维完全展开，也可以用：
+            # position_ids = cache_position.unsqueeze(0).expand(batch_size, -1)
+
+        causal_mask = create_causal_mask(
+            config=self.config,
+            input_embeds=input_embeds,
+            attention_mask=attention_mask,
+            cache_position=cache_position,
+            past_key_values=past_key_values,
+            position_ids=position_ids,
         )
 
-    def forward(self, input_ids: torch.Tensor | None = None, attention_mask: torch.Tensor | None = None, past_key_values: list[tuple[torch.Tensor, torch.Tensor]] | None = None, use_cache: bool = False, **kwargs) -> tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]], torch.Tensor]:
-        # input_ids.shape == (batch_size, seq_len)
-        batch_size, seq_len = input_ids.shape
+        hidden_states: torch.Tensor = self.dropout(input_embeds)
+        # [cos, sin]
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] = self.rotary_emb(hidden_states, position_ids=position_ids)
+        aux_loss = torch.Tensor(0.0, device=hidden_states.device)
 
-        if hasattr(past_key_values, "layers"):
-            past_key_values = None
-        past_key_values = past_key_values or [None] * self.num_hidden_layers
-
-        # past_key_values[0][0].shape == (batch_size, past_seq_len, num_heads, head_dim)
-        begin_pos = past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
-        end_pos = begin_pos + seq_len
-
-        hidden_states = self.dropout(self.embed_tokens(input_ids))
-
-        aux_loss = torch.tensor(0.0, device=hidden_states.device)
-        presents_key_values: list[tuple[torch.Tensor, torch.Tensor]] = []
-        for layer_index, (layer, past_key_value) in enumerate(zip(self.layers, past_key_values)):
-            layer: MiniMindBlock
-            past_key_value: tuple[torch.Tensor, torch.Tensor] | None
-            hidden_states, present_key_values, layer_aux_loss = layer(hidden_states, self.position_embeddings, begin_pos=begin_pos, end_pos=end_pos, use_kv_cache=use_cache, past_key_values=past_key_value, attention_mask=attention_mask)
-            presents_key_values.append(present_key_values)
+        for decoder_layer in self.layers[: self.config.num_hidden_layers]:
+            hidden_states, layer_aux_loss = decoder_layer(
+                hidden_states,
+                attention_mask=causal_mask,
+                position_embeddings=position_embeddings,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+                **kwargs,
+            )
             aux_loss += layer_aux_loss
 
-        hidden_states: torch.Tensor = self.norm(hidden_states)
+        hidden_states = self.norm(hidden_states)
 
-        return hidden_states, presents_key_values, aux_loss
+        return hidden_states, aux_loss
 
 
-class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
-    config_class = MiniMindConfig
-
-    def __init__(self, config: MiniMindConfig):
+class MyMiniMindForCausalLM(MyMinimindPreTrainedModel, GenerationMixin):
+    def __init__(self, config: MyMiniMindConfig):
         super().__init__(config)
-        self.model = MiniMindModel(config)
+        self.model = MyMiniMindModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.model.embed_tokens.weight = self.lm_head.weight
 
-    def forward(
-        self, input_ids: torch.Tensor | None = None, attention_mask: torch.Tensor | None = None, labels: torch.Tensor | None = None, past_key_values: list[tuple[torch.Tensor, torch.Tensor]] | None = None, use_cache: bool = False, logits_to_keep: int | torch.Tensor = 0, **kwargs
-    ) -> tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]], torch.Tensor]:
-        hidden_states, presents_key_values, aux_loss = self.model(input_ids=input_ids, attention_mask=attention_mask, past_key_values=past_key_values, use_cache=use_cache, **kwargs)
+    def forward(self, input_ids: torch.Tensor | None = None, attention_mask: torch.Tensor | None = None, labels: torch.Tensor | None = None, past_key_values: list[tuple[torch.Tensor, torch.Tensor]] | None = None, use_cache: bool = False, logits_to_keep: int | torch.Tensor = 0, **kwargs) -> CausalLMOutputWithPast:
+        hidden_states, aux_loss = self.model(input_ids=input_ids, attention_mask=attention_mask, past_key_values=past_key_values, use_cache=use_cache, **kwargs)
 
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         # hidden_states.shape == (batch_size, seq_len, hidden_size)
         logits: torch.Tensor = self.lm_head(hidden_states[:, slice_indices, :])
 
-        loss = None
+        loss: torch.Tensor | None = None
         if labels is not None:
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[:, 1:].contiguous()
@@ -547,7 +560,7 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
 
             assert not math.isnan(loss), f"loss is nan, shift_logits: {shift_logits}, shift_labels: {shift_labels}"
 
-        output = CausalLMOutputWithPast(loss=loss, logits=logits, past_key_values=presents_key_values, hidden_states=hidden_states)
+        output = CausalLMOutputWithPast(loss=loss, logits=logits, past_key_values=past_key_values, hidden_states=hidden_states)
         output.aux_loss = aux_loss
 
         return output
